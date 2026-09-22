@@ -1,4 +1,8 @@
-use std::{collections::HashSet, env, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    env,
+    path::PathBuf,
+};
 
 use crate::Result;
 use ccusage_adapter_common::collect_files_with_extension;
@@ -38,19 +42,46 @@ pub(super) fn discover_session_files() -> Result<Vec<PathBuf>> {
         }
         let mut compressed = Vec::new();
         collect_files_with_extension(&sessions, "zstd", &mut compressed);
-        files.extend(compressed.into_iter().filter(|path| {
-            path.file_name().and_then(|name| name.to_str()) == Some("session.jsonl.zstd")
-        }));
+        files.extend(compressed);
 
         let mut raw = Vec::new();
         collect_files_with_extension(&sessions, "jsonl", &mut raw);
-        files.extend(raw.into_iter().filter(|path| {
-            path.file_name().and_then(|name| name.to_str()) == Some("session.jsonl")
-        }));
+        files.extend(raw);
     }
-    files.sort();
-    files.dedup();
-    Ok(files)
+    // DSH retains old format generations beside the writable current log.
+    // Pick one generation per session, irrespective of archive modification time.
+    let mut current = BTreeMap::<PathBuf, ((u64, bool), PathBuf)>::new();
+    for path in files {
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let compressed = name.ends_with(".zstd");
+        let raw = name.strip_suffix(".zstd").unwrap_or(name);
+        let version = if raw == "session.jsonl" {
+            0
+        } else if let Some(version) = raw
+            .strip_prefix("session.v")
+            .and_then(|name| name.strip_suffix(".jsonl"))
+        {
+            let Ok(version) = version.parse::<u64>() else {
+                continue;
+            };
+            version
+        } else {
+            continue;
+        };
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        let rank = (version, compressed);
+        if current
+            .get(parent)
+            .is_none_or(|(previous, _)| rank > *previous)
+        {
+            current.insert(parent.to_path_buf(), (rank, path));
+        }
+    }
+    Ok(current.into_values().map(|(_, path)| path).collect())
 }
 
 #[cfg(test)]
@@ -83,6 +114,29 @@ mod tests {
                 .iter()
                 .any(|path| path.ends_with("session.jsonl.zstd"))
         );
+    }
+
+    #[test]
+    fn prefers_latest_generation_without_counting_archived_logs() {
+        let fixture = fs_fixture!({
+            "sessions/project/one/session.jsonl.zstd": "{}\n",
+            "sessions/project/one/session.v2.jsonl.zstd": "{}\n",
+            "sessions/project/one/session.v3.jsonl.zstd": "{}\n",
+            "sessions/project/two/session.v3.jsonl": "{}\n",
+            "sessions/project/two/session.v9.jsonl.bak": "{}\n",
+        });
+        let _guard = EnvVarsGuard::set_many([(
+            DSH_HOME_ENV,
+            Some(OsString::from(fixture.root().as_os_str())),
+        )]);
+        let files = discover_session_files().unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(
+            files
+                .iter()
+                .any(|path| path.ends_with("session.v3.jsonl.zstd"))
+        );
+        assert!(files.iter().any(|path| path.ends_with("session.v3.jsonl")));
     }
 
     #[test]

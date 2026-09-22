@@ -17,6 +17,9 @@ Anything that is not specific to this source belongs in `ccusage-core` or
 
 - `${DSH_HOME:-~/.dsh}/sessions/**/session.jsonl.zstd`
 - `${DSH_HOME:-~/.dsh}/sessions/**/session.jsonl` when DSH compression is disabled
+- DSH 0.1.5 also writes `session.v3.jsonl.zstd` (or `.jsonl`). Discovery selects
+  the highest numbered generation per session directory and never counts its
+  preserved older archives again. Legacy unversioned logs remain supported.
 
 The compressed format is a concatenation of independent Zstandard frames. Packed
 delta-chunk rows are ignored because usage is recorded separately as

@@ -80,6 +80,37 @@ mod tests {
     }
 
     #[test]
+    fn reads_current_generation_and_not_its_legacy_archive() {
+        let legacy = session_log();
+        let current = format!(
+            "{}\n{}\n",
+            legacy.replace("\"version\":0", "\"version\":3"),
+            r#"{"type":"assistant/message","seq":8,"time":1780000000060,"data":{"turn":1,"step":3,"message":{"role":"assistant","content":[]},"usage":{"inputTokens":7,"outputTokens":9}}}"#,
+        );
+        let fixture = fs_fixture!({
+            "sessions/project/session-1/session.jsonl": legacy,
+            "sessions/project/session-1/session.v3.jsonl": current,
+        });
+        let _guard = EnvVarGuard::set("DSH_HOME", fixture.root());
+        let entries = load_entries(&shared(), &PricingMap::default()).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.data.message.usage.input_tokens)
+                .sum::<u64>(),
+            177
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.data.message.usage.output_tokens)
+                .sum::<u64>(),
+            44
+        );
+    }
+
+    #[test]
     fn loads_raw_session_usage_and_replaces_streaming_samples() {
         let fixture = fs_fixture!({
             "sessions/--workspace-project--/session-1/session.jsonl": session_log(),
