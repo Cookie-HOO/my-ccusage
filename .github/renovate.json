@@ -17,6 +17,18 @@
 	"mode": "full",
 	"packageRules": [
 		{
+			"description": "Keep bun2nix lockfile v2/v3 support pinned until released.",
+			"matchManagers": ["nix"],
+			"matchDepNames": ["bun2nix"],
+			"enabled": false
+		},
+		{
+			"description": "Keep the working Tirith scanner pinned until workflow analysis is compatible.",
+			"matchManagers": ["nix"],
+			"matchDepNames": ["tirith-nixpkgs"],
+			"enabled": false
+		},
+		{
 			"description": "Keep schemars on the 0.x API until its schema generator is migrated deliberately.",
 			"matchPackageNames": ["schemars"],
 			"allowedVersions": "<0.9.0"
@@ -28,15 +40,9 @@
 			"enabled": false
 		}
 	],
-	"postUpgradeTasks": {
-		"commands": ["nix run .#generate-bun-nix"],
-		"executionMode": "branch",
-		"installTools": {
-			"nix": {}
-		}
-	},
 	"postUpdateOptions": ["pnpmDedupe"],
 	"rangeStrategy": "bump",
+	"rebaseWhen": "conflicted",
 	"vulnerabilityAlerts": {
 		"labels": ["security"]
 	}

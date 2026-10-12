@@ -14,14 +14,18 @@ use std::{
 use jiff::tz::TimeZone as JiffTimeZone;
 use memchr::memmem;
 use rustc_hash::FxHasher;
-use serde::Deserialize;
+use serde::{
+    Deserialize,
+    de::{DeserializeOwned, Error as _, MapAccess, SeqAccess, Visitor},
+};
+use smallvec::SmallVec;
 
 use crate::{
     LoadedEntry, LoadedFile, PricingMap, Result, Speed, TimestampMs, TokenUsageRaw, UsageEntry,
     UsageSummary, calculate_cost, calculate_cost_for_usage_at,
     cli::{CostMode, SharedArgs},
     debug_log,
-    fast::{FxHashMap, SmallIndexVec, byte_lines, suffix_string},
+    fast::{FxHashMap, byte_lines, suffix_string},
     format_date_tz, log_level, missing_pricing_model_for_usage, parse_ts_timestamp, parse_tz,
     progress,
 };
@@ -29,19 +33,72 @@ use crate::{
 #[doc(hidden)]
 pub use paths::timestamp_from_line;
 pub use paths::usage_files;
-pub(crate) use paths::{claude_paths, extract_project, extract_session_parts};
+pub(crate) use paths::{
+    claude_paths, extract_project, extract_session_parts, split_files_before_since,
+};
 
+struct DedupeIndex {
+    index: usize,
+    session_alias: Option<Arc<str>>,
+}
+
+type DedupeIndexVec = SmallVec<[DedupeIndex; 1]>;
+
+/// Loads every deduplicated Claude usage entry, regardless of `since`.
+///
+/// Use this when a report reads history before the `--since` window, such as
+/// billing blocks anchored on earlier entries or whole-session totals.
 pub fn load_entries(shared: &SharedArgs, project_filter: Option<&str>) -> Result<Vec<LoadedEntry>> {
     progress::track_usage_load(progress::UsageLoadAgent("Claude"), shared.json, || {
-        load_entries_inner(shared, project_filter)
+        load_entries_inner(shared, project_filter, false)
     })
 }
 
+/// Loads Claude usage entries for a report that keeps only entries dated
+/// inside the `--since` window.
+///
+/// Sessions last written before the window are skipped without being read, so
+/// entries dated before `since` may be missing. Callers must discard those
+/// entries, which leaves the in-window result identical to [`load_entries`].
+///
+/// @param shared Report arguments; `since` and `timezone` bound the files read.
+/// @param project_filter Optional project directory to restrict the scan to.
+/// @returns Deduplicated entries, complete for every date on or after `since`.
+pub fn load_entries_since(
+    shared: &SharedArgs,
+    project_filter: Option<&str>,
+) -> Result<Vec<LoadedEntry>> {
+    progress::track_usage_load(progress::UsageLoadAgent("Claude"), shared.json, || {
+        load_entries_inner(shared, project_filter, true)
+    })
+}
+
+/// Loads daily Claude summaries. Summaries dated before `since` may be
+/// missing, so callers must filter them by date.
 pub fn load_daily_summaries(
     shared: &SharedArgs,
     project_filter: Option<&str>,
     group_by_project: bool,
 ) -> Result<Vec<UsageSummary>> {
+    Ok(load_daily_summaries_with_detection(shared, project_filter, group_by_project)?.summaries)
+}
+
+/// Daily Claude summaries plus whether any Claude usage exists at all.
+pub struct DailySummaries {
+    /// Summaries, possibly missing dates before `since`.
+    pub summaries: Vec<UsageSummary>,
+    /// Whether any usage file holds an entry, including files skipped as
+    /// outside the `--since` window.
+    pub detected: bool,
+}
+
+/// Loads daily Claude summaries like [`load_daily_summaries`] and reports
+/// whether Claude usage was detected independently of the date window.
+pub fn load_daily_summaries_with_detection(
+    shared: &SharedArgs,
+    project_filter: Option<&str>,
+    group_by_project: bool,
+) -> Result<DailySummaries> {
     progress::track_usage_load(progress::UsageLoadAgent("Claude"), shared.json, || {
         daily::load_daily_summaries_inner(shared, project_filter, group_by_project)
     })
@@ -50,6 +107,7 @@ pub fn load_daily_summaries(
 fn load_entries_inner(
     shared: &SharedArgs,
     project_filter: Option<&str>,
+    skip_files_before_since: bool,
 ) -> Result<Vec<LoadedEntry>> {
     let paths = claude_paths()?;
     debug_log(
@@ -65,6 +123,20 @@ fn load_entries_inner(
     );
     let files = usage_files(&paths, project_filter);
     debug_log(shared, format!("Found {} JSONL usage files", files.len()));
+    let files = if skip_files_before_since {
+        split_files_before_since(files, shared, utc_now()).kept
+    } else {
+        files
+    };
+    if skip_files_before_since && shared.since.is_some() {
+        debug_log(
+            shared,
+            format!(
+                "Kept {} JSONL usage files inside the --since window",
+                files.len()
+            ),
+        );
+    }
     if files.is_empty() {
         return Ok(Vec::new());
     }
@@ -95,7 +167,7 @@ fn load_entries_inner(
         ),
     );
 
-    let mut deduped_indexes: FxHashMap<u64, SmallIndexVec> = FxHashMap::default();
+    let mut deduped_indexes: FxHashMap<u64, DedupeIndexVec> = FxHashMap::default();
     let mut deduped: Vec<LoadedEntry> =
         Vec::with_capacity(loaded_files.iter().map(|file| file.entries.len()).sum());
     for loaded_file in loaded_files {
@@ -141,38 +213,54 @@ fn should_replace_deduped_entry(candidate: &UsageEntry, existing: &UsageEntry) -
 
 fn push_deduped_entry(
     entry: LoadedEntry,
-    deduped_indexes: &mut FxHashMap<u64, SmallIndexVec>,
+    deduped_indexes: &mut FxHashMap<u64, DedupeIndexVec>,
     deduped: &mut Vec<LoadedEntry>,
 ) {
     let dedupe_lookup = entry.data.message.id.as_deref().map(|message_id| {
         let request_id = entry.data.request_id.as_deref();
         let session_id = loaded_entry_session_id(&entry);
-        let exact_hash = usage_dedupe_hash(message_id, request_id, session_id);
+        let exact_hash = usage_dedupe_hash(message_id, request_id, session_id, entry.timestamp);
         let existing_index = deduped_indexes
             .get(&exact_hash)
             .and_then(|indexes| {
-                indexes.iter().copied().find(|&index| {
+                indexes.iter().find_map(|dedupe_index| {
                     loaded_entry_matches_dedupe_key(
-                        &deduped[index],
+                        &deduped[dedupe_index.index],
                         message_id,
                         request_id,
                         session_id,
+                        entry.timestamp,
                     )
+                    .then_some(dedupe_index.index)
                 })
             })
             .or_else(|| {
-                // /btw sidechain logs can replay parent messages with new request IDs.
-                let message_hash = usage_dedupe_hash(message_id, None, session_id);
+                // /btw sidechain logs can replay parent messages with new request IDs. A
+                // replay needs a sidechain on at least one side, so a parent candidate only
+                // has to look through sidechain entries; this keeps gateway logs that reuse
+                // one message ID for every response from rescanning all earlier entries.
                 let candidate_is_sidechain = is_sidechain_usage_entry(&entry.data);
-                deduped_indexes.get(&message_hash).and_then(|indexes| {
-                    indexes.iter().copied().find(|&index| {
-                        loaded_entry_matches_sidechain_dedupe_key(
-                            &deduped[index],
-                            message_id,
-                            session_id,
-                            entry.timestamp,
-                            candidate_is_sidechain,
-                        )
+                let route_hash = if candidate_is_sidechain {
+                    sidechain_replay_dedupe_hash(message_id, session_id)
+                } else {
+                    sidechain_entry_replay_dedupe_hash(message_id, session_id)
+                };
+                deduped_indexes.get(&route_hash).and_then(|indexes| {
+                    indexes.iter().find_map(|dedupe_index| {
+                        let existing = &deduped[dedupe_index.index];
+                        let indexed_session_id = dedupe_index
+                            .session_alias
+                            .as_deref()
+                            .unwrap_or_else(|| loaded_entry_session_id(existing));
+                        (indexed_session_id == session_id
+                            && loaded_entry_matches_sidechain_dedupe_key(
+                                existing,
+                                message_id,
+                                request_id,
+                                entry.timestamp,
+                                candidate_is_sidechain,
+                            ))
+                        .then_some(dedupe_index.index)
                     })
                 })
             });
@@ -180,16 +268,50 @@ fn push_deduped_entry(
     });
 
     if let Some((hash, Some(index))) = dedupe_lookup {
+        let candidate_session_id = loaded_entry_session_id(&entry);
+        let existing_session_id = loaded_entry_session_id(&deduped[index]);
+        if candidate_session_id != existing_session_id
+            && let Some(message_id) = entry.data.message.id.as_deref()
+        {
+            // Cross-session copies can become the survivor, so keep every session route used by
+            // later sidechain replays.
+            for session_id in [candidate_session_id, existing_session_id] {
+                for route_hash in [
+                    sidechain_replay_dedupe_hash(message_id, session_id),
+                    sidechain_entry_replay_dedupe_hash(message_id, session_id),
+                ] {
+                    push_deduped_session_alias(deduped_indexes, route_hash, index, session_id);
+                }
+            }
+        }
         if should_replace_deduped_entry(&entry.data, &deduped[index].data) {
-            deduped[index] = entry;
-            push_deduped_index(deduped_indexes, hash, index);
-            if let Some(message_id) = deduped[index].data.message.id.as_deref() {
+            let previous = std::mem::replace(&mut deduped[index], entry);
+            // The survivor is already indexed under its previous keys. Only register the keys
+            // that changed, so repeated same-timestamp rewrites do not rescan large buckets.
+            if loaded_entry_exact_hash(&previous) != Some(hash) {
+                push_deduped_index(deduped_indexes, hash, index);
+            }
+            let replay_route_changed = loaded_entry_session_id(&previous)
+                != loaded_entry_session_id(&deduped[index])
+                || is_sidechain_usage_entry(&previous.data)
+                    != is_sidechain_usage_entry(&deduped[index].data)
+                || previous.data.message.id != deduped[index].data.message.id;
+            if replay_route_changed
+                && let Some(message_id) = deduped[index].data.message.id.as_deref()
+            {
                 let session_id = loaded_entry_session_id(&deduped[index]);
                 push_deduped_index(
                     deduped_indexes,
-                    usage_dedupe_hash(message_id, None, session_id),
+                    sidechain_replay_dedupe_hash(message_id, session_id),
                     index,
                 );
+                if is_sidechain_usage_entry(&deduped[index].data) {
+                    push_deduped_index(
+                        deduped_indexes,
+                        sidechain_entry_replay_dedupe_hash(message_id, session_id),
+                        index,
+                    );
+                }
             }
         }
         return;
@@ -198,27 +320,34 @@ fn push_deduped_entry(
     let index = deduped.len();
     deduped.push(entry);
     if let Some((hash, None)) = dedupe_lookup {
-        push_deduped_index(deduped_indexes, hash, index);
+        // `index` is new, so none of these buckets can already hold it.
+        push_new_deduped_index(deduped_indexes, hash, index);
         if let Some(message_id) = deduped[index].data.message.id.as_deref() {
             let session_id = loaded_entry_session_id(&deduped[index]);
-            push_deduped_index(
+            push_new_deduped_index(
                 deduped_indexes,
-                usage_dedupe_hash(message_id, None, session_id),
+                sidechain_replay_dedupe_hash(message_id, session_id),
                 index,
             );
+            if is_sidechain_usage_entry(&deduped[index].data) {
+                push_new_deduped_index(
+                    deduped_indexes,
+                    sidechain_entry_replay_dedupe_hash(message_id, session_id),
+                    index,
+                );
+            }
         }
     }
 }
 
-fn usage_dedupe_hash(message_id: &str, request_id: Option<&str>, session_id: &str) -> u64 {
-    let mut hasher = FxHasher::default();
-    message_id.hash(&mut hasher);
-    request_id.hash(&mut hasher);
-    session_id.hash(&mut hasher);
-    hasher.finish()
-}
-
-fn daily_usage_dedupe_hash(
+/// Exact-match dedupe key shared by the entry and daily loaders.
+///
+/// Matching message and request IDs identify one response across sessions. Without a request
+/// ID, gateways can reuse one message ID for every response, so the key is scoped to the
+/// session and timestamp instead. Real Anthropic IDs (`msg_` prefix) are unique per response,
+/// so requestless entries with one collapse by session across timestamps: Claude Code writes
+/// one line per content block with the same `message.id` but distinct timestamps.
+fn usage_dedupe_hash(
     message_id: &str,
     request_id: Option<&str>,
     session_id: &str,
@@ -227,11 +356,22 @@ fn daily_usage_dedupe_hash(
     let mut hasher = FxHasher::default();
     message_id.hash(&mut hasher);
     request_id.hash(&mut hasher);
-    session_id.hash(&mut hasher);
     if request_id.is_none() {
-        timestamp.hash(&mut hasher);
+        session_id.hash(&mut hasher);
+        if !is_anthropic_message_id(message_id) {
+            timestamp.hash(&mut hasher);
+        }
     }
     hasher.finish()
+}
+
+/// Real Anthropic message IDs are unique per response, unlike the placeholder IDs gateways
+/// reuse for every response.
+///
+/// The prefix is a heuristic: only a request ID proves two lines belong to one response, so a
+/// gateway that reused a `msg_`-shaped placeholder would collapse to one entry per session.
+pub(crate) fn is_anthropic_message_id(message_id: &str) -> bool {
+    message_id.starts_with("msg_")
 }
 
 fn sidechain_replay_dedupe_hash(message_id: &str, session_id: &str) -> u64 {
@@ -240,6 +380,26 @@ fn sidechain_replay_dedupe_hash(message_id: &str, session_id: &str) -> u64 {
     message_id.hash(&mut hasher);
     session_id.hash(&mut hasher);
     hasher.finish()
+}
+
+/// Replay route that only indexes sidechain entries, for parent candidates.
+fn sidechain_entry_replay_dedupe_hash(message_id: &str, session_id: &str) -> u64 {
+    let mut hasher = FxHasher::default();
+    "sidechain-replay-entry".hash(&mut hasher);
+    message_id.hash(&mut hasher);
+    session_id.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn loaded_entry_exact_hash(entry: &LoadedEntry) -> Option<u64> {
+    entry.data.message.id.as_deref().map(|message_id| {
+        usage_dedupe_hash(
+            message_id,
+            entry.data.request_id.as_deref(),
+            loaded_entry_session_id(entry),
+            entry.timestamp,
+        )
+    })
 }
 
 fn loaded_entry_session_id(entry: &LoadedEntry) -> &str {
@@ -255,22 +415,27 @@ fn loaded_entry_matches_dedupe_key(
     message_id: &str,
     request_id: Option<&str>,
     session_id: &str,
+    timestamp: TimestampMs,
 ) -> bool {
     entry.data.message.id.as_deref() == Some(message_id)
         && entry.data.request_id.as_deref() == request_id
-        && loaded_entry_session_id(entry) == session_id
+        && (request_id.is_some()
+            || (loaded_entry_session_id(entry) == session_id
+                && (is_anthropic_message_id(message_id) || entry.timestamp == timestamp)))
 }
 
 fn loaded_entry_matches_sidechain_dedupe_key(
     entry: &LoadedEntry,
     message_id: &str,
-    session_id: &str,
+    request_id: Option<&str>,
     timestamp: TimestampMs,
     candidate_is_sidechain: bool,
 ) -> bool {
+    // Requestless replays match across timestamps, as in the daily loader. Replays that carry
+    // a new request ID still need the parent's timestamp in this loader.
+    let requestless = request_id.is_none() && entry.data.request_id.is_none();
     entry.data.message.id.as_deref() == Some(message_id)
-        && loaded_entry_session_id(entry) == session_id
-        && entry.timestamp == timestamp
+        && (requestless || entry.timestamp == timestamp)
         && (candidate_is_sidechain || is_sidechain_usage_entry(&entry.data))
 }
 
@@ -279,13 +444,47 @@ fn is_sidechain_usage_entry(entry: &UsageEntry) -> bool {
 }
 
 fn push_deduped_index(
-    deduped_indexes: &mut FxHashMap<u64, SmallIndexVec>,
+    deduped_indexes: &mut FxHashMap<u64, DedupeIndexVec>,
     hash: u64,
     index: usize,
 ) {
     let indexes = deduped_indexes.entry(hash).or_default();
-    if !indexes.contains(&index) {
-        indexes.push(index);
+    if !indexes
+        .iter()
+        .any(|dedupe_index| dedupe_index.index == index && dedupe_index.session_alias.is_none())
+    {
+        indexes.push(DedupeIndex {
+            index,
+            session_alias: None,
+        });
+    }
+}
+
+fn push_new_deduped_index(
+    deduped_indexes: &mut FxHashMap<u64, DedupeIndexVec>,
+    hash: u64,
+    index: usize,
+) {
+    deduped_indexes.entry(hash).or_default().push(DedupeIndex {
+        index,
+        session_alias: None,
+    });
+}
+
+fn push_deduped_session_alias(
+    deduped_indexes: &mut FxHashMap<u64, DedupeIndexVec>,
+    hash: u64,
+    index: usize,
+    session_id: &str,
+) {
+    let indexes = deduped_indexes.entry(hash).or_default();
+    if !indexes.iter().any(|dedupe_index| {
+        dedupe_index.index == index && dedupe_index.session_alias.as_deref() == Some(session_id)
+    }) {
+        indexes.push(DedupeIndex {
+            index,
+            session_alias: Some(Arc::from(session_id)),
+        });
     }
 }
 
@@ -312,10 +511,7 @@ fn read_usage_file(
         if usage_marker.find(line).is_none() {
             continue;
         }
-        if has_unsupported_null_field(line) {
-            continue;
-        }
-        let Ok(data) = serde_json::from_slice::<UsageEntry>(line) else {
+        let Some(data) = deserialize_usage_line::<UsageEntry>(line) else {
             continue;
         };
         let Some(timestamp) = parse_ts_timestamp(&data.timestamp) else {
@@ -510,30 +706,162 @@ fn is_valid_usage_entry(data: &UsageEntry) -> bool {
     true
 }
 
-pub(crate) fn has_unsupported_null_field(line: &[u8]) -> bool {
-    let mut offset = 0;
-    while let Some(relative_index) = memmem::find(&line[offset..], b":null") {
-        let null_index = offset + relative_index;
-        let mut field_end = null_index.saturating_sub(1);
-        if line.get(field_end) != Some(&b'"') {
-            while field_end > 0 && line[field_end] != b'"' {
-                field_end -= 1;
-            }
-        }
-        if line.get(field_end) == Some(&b'"') {
-            let mut field_start = field_end.saturating_sub(1);
-            while field_start > 0 && line[field_start] != b'"' {
-                field_start -= 1;
-            }
-            if line.get(field_start) == Some(&b'"')
-                && is_unsupported_nullable_field(&line[field_start + 1..field_end])
-            {
-                return true;
-            }
-        }
-        offset = null_index + b":null".len();
+/// Mirrors the TypeScript loader's schema: a line whose known non-nullable field is `null`
+/// is skipped before deserialisation. The direct `model` member of an element in either
+/// assistant or AgentProgress `usage.iterations` is the one exception, because
+/// `UsageIteration.model` is optional and Claude Code writes it as `null`.
+#[cfg(test)]
+fn has_unsupported_null_field(line: &[u8]) -> bool {
+    if memmem::find(line, b"null").is_none() {
+        return false;
     }
-    false
+    let Ok(root) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return false;
+    };
+    has_unsupported_null_field_in_value(&root)
+}
+
+/// Deserializes a transcript line while enforcing Claude's nullable-field contract.
+/// Lines containing `null` are parsed into a value once so structural validation and
+/// typed deserialization can share the same parse.
+pub(crate) fn deserialize_usage_line<T: DeserializeOwned>(line: &[u8]) -> Option<T> {
+    if memmem::find(line, b"null").is_none() {
+        return serde_json::from_slice(line).ok();
+    }
+    let root = serde_json::from_slice::<UniqueJsonValue>(line).ok()?.0;
+    if has_unsupported_null_field_in_value(&root) {
+        return None;
+    }
+    serde_json::from_value(root).ok()
+}
+
+/// A JSON value parser that preserves typed Serde's rejection of duplicate members.
+/// Parsing through `serde_json::Value` normally keeps only the final duplicate, which could
+/// make a malformed transcript valid before the in-memory typed deserialization runs.
+struct UniqueJsonValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonValueVisitor)
+    }
+}
+
+struct UniqueJsonValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonValueVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value without duplicate object members")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, value: f64) -> std::result::Result<Self::Value, E> {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .map(UniqueJsonValue)
+            .ok_or_else(|| E::custom("non-finite JSON number"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::String(value.to_owned())))
+    }
+
+    fn visit_string<E>(self, value: String) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> std::result::Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> std::result::Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        UniqueJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> std::result::Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut fields = serde_json::Map::new();
+        while let Some(field) = object.next_key::<String>()? {
+            if fields.contains_key(&field) {
+                return Err(A::Error::custom(format!(
+                    "duplicate object member `{field}`"
+                )));
+            }
+            let value = object.next_value::<UniqueJsonValue>()?;
+            fields.insert(field, value.0);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Object(fields)))
+    }
+}
+
+fn has_unsupported_null_field_in_value(root: &serde_json::Value) -> bool {
+    let iteration_arrays = [
+        root.pointer("/message/usage/iterations"),
+        root.pointer("/data/message/message/usage/iterations"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    has_unsupported_null_value(root, false, &iteration_arrays)
+}
+
+fn has_unsupported_null_value(
+    value: &serde_json::Value,
+    allow_iteration_model: bool,
+    iteration_arrays: &[&serde_json::Value],
+) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => fields.iter().any(|(field, value)| {
+            if value.is_null() && is_unsupported_nullable_field(field.as_bytes()) {
+                return !(allow_iteration_model && field == "model");
+            }
+            has_unsupported_null_value(value, false, iteration_arrays)
+        }),
+        serde_json::Value::Array(values) => {
+            let is_iteration_array = iteration_arrays
+                .iter()
+                .any(|array| std::ptr::eq(*array, value));
+            values.iter().any(|value| {
+                has_unsupported_null_value(value, is_iteration_array, iteration_arrays)
+            })
+        }
+        _ => false,
+    }
 }
 
 fn is_unsupported_nullable_field(field: &[u8]) -> bool {
@@ -619,8 +947,8 @@ mod tests {
     use std::{path::Path, sync::Arc};
 
     use super::{
-        extract_session_parts, has_unsupported_null_field, paths::is_project_path_segment,
-        push_deduped_entry, read_usage_file, usage_files,
+        deserialize_usage_line, extract_session_parts, has_unsupported_null_field,
+        paths::is_project_path_segment, push_deduped_entry, read_usage_file, usage_files,
     };
     use crate::{
         LoadedEntry, PricingMap, TimestampMs, TokenUsageRaw, UsageEntry, UsageMessage,
@@ -702,6 +1030,9 @@ mod tests {
             br#"{"message":{"model":null,"usage":{"input_tokens":0}}}"#
         ));
         assert!(has_unsupported_null_field(
+            br#"{"message":{"model": null,"usage":{"input_tokens":0}}}"#
+        ));
+        assert!(has_unsupported_null_field(
             br#"{"sessionId":null,"message":{"usage":{"input_tokens":0}}}"#
         ));
     }
@@ -711,6 +1042,122 @@ mod tests {
         assert!(!has_unsupported_null_field(
             br#"{"message":{"content":null,"usage":{"input_tokens":0}}}"#
         ));
+    }
+
+    /// Claude Code 2.1.266+ writes `"model":null` for the main-model iteration of Fable 5.1
+    /// entries; `UsageIteration.model` is optional, so those lines must be kept while every
+    /// other unsupported null keeps being rejected.
+    #[test]
+    fn allows_null_iteration_model_but_still_rejects_other_nulls() {
+        assert!(!has_unsupported_null_field(
+            br#"{"message":{"model":"claude-fable-5-1","usage":{"input_tokens":2,"output_tokens":289,"iterations":[{"type":"message","model":null,"input_tokens":2,"output_tokens":289}]}}}"#
+        ));
+        // A missing iteration model and an empty iterations array are unchanged.
+        assert!(!has_unsupported_null_field(
+            br#"{"message":{"model":"m","usage":{"input_tokens":2,"iterations":[{"type":"message","input_tokens":2}]}}}"#
+        ));
+        assert!(!has_unsupported_null_field(
+            br#"{"message":{"model":"m","usage":{"input_tokens":2,"iterations":[]}}}"#
+        ));
+        // Strings inside the array may contain brackets or escaped quotes without ending the span.
+        assert!(!has_unsupported_null_field(
+            br#"{"message":{"model":"m","usage":{"iterations":[{"type":"ad]vi\"sor}","model":null,"input_tokens":1}]}}}"#
+        ));
+        // `message.model` null is still rejected, before or after the iterations array.
+        assert!(has_unsupported_null_field(
+            br#"{"message":{"model":null,"usage":{"iterations":[{"type":"message","model":"m"}]}}}"#
+        ));
+        assert!(has_unsupported_null_field(
+            br#"{"message":{"usage":{"iterations":[{"type":"message","model":"m"}]},"model":null}}"#
+        ));
+        // Other unsupported nulls inside the array are still rejected.
+        assert!(has_unsupported_null_field(
+            br#"{"message":{"model":"m","usage":{"iterations":[{"type":"message","model":null,"cache_read_input_tokens":null}]}}}"#
+        ));
+    }
+
+    /// The exemption is scoped to the `iterations` member of a `usage` object: whitespace
+    /// around the member is fine, but a same-named array elsewhere in the line, an `iterations`
+    /// member nested deeper inside `usage`, or the key as text inside a string never qualifies.
+    #[test]
+    fn scopes_the_iteration_model_exemption_to_the_usage_object() {
+        // JSON whitespace between the key, the colon and the array is tolerated.
+        assert!(!has_unsupported_null_field(
+            br#"{"message": {"model": "m", "usage" : { "input_tokens": 2, "iterations" : [ {"type": "message", "model": null} ] }}}"#
+        ));
+        // Escaped property names are decoded before the structural path check.
+        assert!(!has_unsupported_null_field(
+            br#"{"message":{"model":"m","usage":{"iter\u0061tions" : [{"type":"message","model" : null}]}}}"#
+        ));
+        // An earlier `iterations` array in another object does not stand in for the real one.
+        assert!(!has_unsupported_null_field(
+            br#"{"toolUseResult":{"iterations":[{"model":"x"}]},"message":{"model":"m","usage":{"iterations":[{"type":"message","model":null}]}}}"#
+        ));
+        assert!(has_unsupported_null_field(
+            br#"{"toolUseResult":{"iterations":[{"model":null}]},"message":{"model":"m","usage":{"input_tokens":1}}}"#
+        ));
+        // A `usage` member that is not an object is skipped in favor of the real one.
+        assert!(!has_unsupported_null_field(
+            br#"{"usage":"n/a","message":{"model":"m","usage":{"iterations":[{"type":"message","model":null}]}}}"#
+        ));
+        // Only a direct member of `usage` counts, not one nested deeper inside it.
+        assert!(has_unsupported_null_field(
+            br#"{"message":{"model":"m","usage":{"server_tool_use":{"iterations":[{"model":null}]},"input_tokens":1}}}"#
+        ));
+        // A nested object's model is not the optional model of the iteration itself.
+        assert!(has_unsupported_null_field(
+            br#"{"message":{"model":"m","usage":{"iterations":[{"type":"message","metadata":{"model":null}}]}}}"#
+        ));
+        // The key as text inside a string value is not a member.
+        assert!(has_unsupported_null_field(
+            br#"{"message":{"content":"\"usage\":{\"iterations\":[","model":null,"usage":{"input_tokens":1}}}"#
+        ));
+        // Members before `iterations` may hold nested containers and strings with brackets.
+        assert!(!has_unsupported_null_field(
+            br#"{"message":{"model":"m","usage":{"cache_creation":{"ephemeral_5m_input_tokens":0},"server_tool_use":{"web_search_requests":0},"inference_geo":"[not]{available}","iterations":[{"type":"message","model":null}]}}}"#
+        ));
+        // Only the direct `message.usage` object may provide the exempted array.
+        assert!(!has_unsupported_null_field(
+            br#"{"usage":{"iterations":[{"model":"decoy"}]},"message":{"model":"m","usage":{"iterations":[{"type":"message","model":null}]}}}"#
+        ));
+        // AgentProgress records wrap the assistant message under `data.message.message`.
+        assert!(!has_unsupported_null_field(
+            br#"{"type":"progress","data":{"message":{"message":{"model":"m","usage":{"iterations":[{"type":"message","model":null}]}}}}}"#
+        ));
+    }
+
+    #[test]
+    fn malformed_usage_members_do_not_panic_the_null_precheck() {
+        assert!(!has_unsupported_null_field(
+            br#"{"message":{"model":"m","usage":{"input_tokens":,"iterations":[{"type":"message","model":null}]}}}"#
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_members_before_typed_deserialization() {
+        assert!(deserialize_usage_line::<UsageEntry>(
+            br#"{"type":"assistant","timestamp":"2026-09-12T04:38:42.296Z","sessionId":"session-a","message":{"id":"msg_1","model":"first","model":"second","usage":{"input_tokens":2,"output_tokens":289,"iterations":[{"type":"message","model":null,"input_tokens":2,"output_tokens":289}]}}}"#
+        )
+        .is_none());
+    }
+
+    /// The repro line from #1710 loads as one Fable 5.1 entry with its own token counts.
+    #[test]
+    fn counts_entries_whose_iteration_model_is_null() {
+        let fixture = fs_fixture!({
+            "projects/project-a/session-a/chat.jsonl": r#"{"type":"assistant","timestamp":"2026-09-12T04:38:42.296Z","version":"2.1.268","sessionId":"session-a","requestId":"req_1","message":{"id":"msg_1","model":"claude-fable-5-1","role":"assistant","usage":{"input_tokens":2,"cache_creation_input_tokens":55866,"cache_read_input_tokens":0,"output_tokens":289,"iterations":[{"type":"message","model":null,"input_tokens":2,"output_tokens":289,"cache_creation_input_tokens":55866,"cache_read_input_tokens":0}]}}}"#,
+        });
+
+        let loaded = read_usage_file(
+            &fixture.path("projects/project-a/session-a/chat.jsonl"),
+            None,
+            CostMode::Calculate,
+            Some(&PricingMap::default()),
+        );
+
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].model.as_deref(), Some("claude-fable-5-1"));
+        assert_eq!(loaded.entries[0].data.message.usage.output_tokens, 289);
     }
 
     #[test]
@@ -775,11 +1222,69 @@ mod tests {
     }
 
     #[test]
-    fn dedupes_requestless_usage_from_same_session_at_distinct_timestamps() {
+    fn keeps_requestless_usage_from_same_session_at_distinct_timestamps() {
         let fixture = fs_fixture!({
             "projects/project-a/session-a/chat.jsonl": [
                 r#"{"timestamp":"2026-05-22T02:34:40.000Z","message":{"id":"ocgo","model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":25}}}"#,
                 r#"{"timestamp":"2026-05-22T02:34:41.000Z","message":{"id":"ocgo","model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":250,"speed":"standard"}}}"#,
+            ]
+            .join("\n"),
+        });
+        let mut deduped_indexes = Default::default();
+        let mut deduped = Vec::new();
+
+        let loaded = read_usage_file(
+            &fixture.path("projects/project-a/session-a/chat.jsonl"),
+            None,
+            CostMode::Display,
+            None,
+        );
+        for entry in loaded.entries {
+            push_deduped_entry(entry, &mut deduped_indexes, &mut deduped);
+        }
+
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(
+            deduped
+                .iter()
+                .map(|entry| entry.data.message.usage.output_tokens)
+                .sum::<u64>(),
+            275
+        );
+    }
+
+    #[test]
+    fn dedupes_anthropic_message_id_from_same_session_at_distinct_timestamps() {
+        let fixture = fs_fixture!({
+            "projects/project-a/session-a/chat.jsonl": [
+                r#"{"timestamp":"2026-05-22T02:34:40.000Z","message":{"id":"msg_01AbC2DeF3","model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":25}}}"#,
+                r#"{"timestamp":"2026-05-22T02:34:40.500Z","message":{"id":"msg_01AbC2DeF3","model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":25}}}"#,
+            ]
+            .join("\n"),
+        });
+        let mut deduped_indexes = Default::default();
+        let mut deduped = Vec::new();
+
+        let loaded = read_usage_file(
+            &fixture.path("projects/project-a/session-a/chat.jsonl"),
+            None,
+            CostMode::Display,
+            None,
+        );
+        for entry in loaded.entries {
+            push_deduped_entry(entry, &mut deduped_indexes, &mut deduped);
+        }
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].data.message.usage.output_tokens, 25);
+    }
+
+    #[test]
+    fn dedupes_repeated_requestless_writes_at_the_same_timestamp() {
+        let fixture = fs_fixture!({
+            "projects/project-a/session-a/chat.jsonl": [
+                r#"{"timestamp":"2026-05-22T02:34:40.000Z","message":{"id":"ocgo","model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":25}}}"#,
+                r#"{"timestamp":"2026-05-22T02:34:40.000Z","message":{"id":"ocgo","model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":250,"speed":"standard"}}}"#,
             ]
             .join("\n"),
         });
@@ -821,6 +1326,118 @@ mod tests {
 
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].data.message.usage.input_tokens, 200);
+    }
+
+    #[test]
+    fn dedupes_copied_transcripts_with_the_same_request_id_across_sessions() {
+        let fixture = fs_fixture!({
+            "projects/project-a/session-a/chat.jsonl": r#"{"timestamp":"2026-05-22T02:34:40.000Z","sessionId":"session-a","requestId":"req-shared","message":{"id":"msg-shared","model":"claude-sonnet-4-20250514","usage":{"input_tokens":100,"output_tokens":1}}}"#,
+            "projects/project-a/session-b/chat.jsonl": r#"{"timestamp":"2026-05-22T02:34:40.000Z","sessionId":"session-b","requestId":"req-shared","message":{"id":"msg-shared","model":"claude-sonnet-4-20250514","usage":{"input_tokens":200,"output_tokens":1}}}"#,
+        });
+        let mut deduped_indexes = Default::default();
+        let mut deduped = Vec::new();
+
+        for path in [
+            fixture.path("projects/project-a/session-a/chat.jsonl"),
+            fixture.path("projects/project-a/session-b/chat.jsonl"),
+        ] {
+            let loaded = read_usage_file(&path, None, CostMode::Display, None);
+            for entry in loaded.entries {
+                push_deduped_entry(entry, &mut deduped_indexes, &mut deduped);
+            }
+        }
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].data.message.usage.input_tokens, 200);
+    }
+
+    #[test]
+    fn dedupes_sidechain_replay_after_an_equal_copy_from_another_session() {
+        let mut deduped_indexes = Default::default();
+        let mut deduped = Vec::new();
+
+        let mut copied_parent = loaded_usage_entry(UsageEntryFixture {
+            message_id: "msg-parent",
+            request_id: "req-parent",
+            is_sidechain: false,
+            cache_read_tokens: 20,
+            output_tokens: 10,
+        });
+        copied_parent.data.session_id = Some("session-b".to_string());
+        copied_parent.session_id = Arc::from("session-b");
+        push_deduped_entry(copied_parent, &mut deduped_indexes, &mut deduped);
+
+        push_deduped_entry(
+            loaded_usage_entry(UsageEntryFixture {
+                message_id: "msg-parent",
+                request_id: "req-parent",
+                is_sidechain: false,
+                cache_read_tokens: 20,
+                output_tokens: 10,
+            }),
+            &mut deduped_indexes,
+            &mut deduped,
+        );
+        push_deduped_entry(
+            loaded_usage_entry(UsageEntryFixture {
+                message_id: "msg-parent",
+                request_id: "req-sidechain-replay",
+                is_sidechain: true,
+                cache_read_tokens: 50_000,
+                output_tokens: 10,
+            }),
+            &mut deduped_indexes,
+            &mut deduped,
+        );
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].data.request_id.as_deref(), Some("req-parent"));
+        assert_eq!(deduped[0].data.message.usage.cache_read_input_tokens, 20);
+    }
+
+    #[test]
+    fn dedupes_sidechain_replay_after_cross_session_survivor_replacement() {
+        let mut deduped_indexes = Default::default();
+        let mut deduped = Vec::new();
+
+        let mut copied_parent = loaded_usage_entry(UsageEntryFixture {
+            message_id: "msg-parent",
+            request_id: "req-parent",
+            is_sidechain: false,
+            cache_read_tokens: 20,
+            output_tokens: 10,
+        });
+        copied_parent.data.session_id = Some("session-b".to_string());
+        copied_parent.session_id = Arc::from("session-b");
+        push_deduped_entry(copied_parent, &mut deduped_indexes, &mut deduped);
+
+        push_deduped_entry(
+            loaded_usage_entry(UsageEntryFixture {
+                message_id: "msg-parent",
+                request_id: "req-parent",
+                is_sidechain: false,
+                cache_read_tokens: 30,
+                output_tokens: 10,
+            }),
+            &mut deduped_indexes,
+            &mut deduped,
+        );
+
+        let mut copied_session_replay = loaded_usage_entry(UsageEntryFixture {
+            message_id: "msg-parent",
+            request_id: "req-sidechain-replay",
+            is_sidechain: true,
+            cache_read_tokens: 50_000,
+            output_tokens: 10,
+        });
+        copied_session_replay.data.session_id = Some("session-b".to_string());
+        copied_session_replay.session_id = Arc::from("session-b");
+        push_deduped_entry(copied_session_replay, &mut deduped_indexes, &mut deduped);
+
+        assert_eq!(deduped.len(), 1);
+        assert_eq!(deduped[0].data.request_id.as_deref(), Some("req-parent"));
+        assert_eq!(deduped[0].session_id.as_ref(), "session-a");
+        assert_eq!(deduped[0].data.message.usage.cache_read_input_tokens, 30);
     }
 
     #[test]

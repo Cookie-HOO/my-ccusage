@@ -337,6 +337,113 @@ fn renders_all_report_json_with_period_and_agent_metadata() {
 }
 
 #[test]
+fn all_report_totals_list_unpriced_models_only_when_present() {
+    let mut row = AllRow {
+        period: "2026-01-02".to_string(),
+        agent: "all",
+        models_used: vec!["new-model".to_string(), "gpt-5".to_string()],
+        input_tokens: 100,
+        output_tokens: 20,
+        cache_creation_tokens: 0,
+        cache_read_tokens: 10,
+        total_tokens: 130,
+        total_cost: 0.01,
+        metadata: None,
+        metadata_agents: None,
+        agent_breakdowns: None,
+        model_breakdowns: vec![
+            ModelBreakdown {
+                model_name: "new-model".to_string(),
+                input_tokens: 50,
+                output_tokens: 10,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+                extra_total_tokens: 0,
+                cost: 0.0,
+                missing_pricing: true,
+            },
+            ModelBreakdown {
+                model_name: "gpt-5".to_string(),
+                input_tokens: 50,
+                output_tokens: 10,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 10,
+                extra_total_tokens: 0,
+                cost: 0.01,
+                missing_pricing: false,
+            },
+        ],
+    };
+
+    let report = report_json(std::slice::from_ref(&row), AgentReportKind::Daily);
+    assert_eq!(report["totals"]["unpricedModels"], json!(["new-model"]));
+    assert_eq!(
+        report["daily"][0]["modelBreakdowns"][0]["missingPricing"],
+        true
+    );
+    assert!(
+        report["daily"][0]["modelBreakdowns"][1]
+            .get("missingPricing")
+            .is_none()
+    );
+
+    let nested = report_json_with_agents(
+        &[AllRow {
+            agent_breakdowns: Some(vec![row.clone()]),
+            ..row.clone()
+        }],
+        AgentReportKind::Daily,
+        true,
+    );
+    assert_eq!(
+        nested["daily"][0]["agents"][0]["modelBreakdowns"][0]["missingPricing"],
+        true
+    );
+
+    let priced_session = AllRow {
+        period: "session-a".to_string(),
+        model_breakdowns: vec![row.model_breakdowns[1].clone()],
+        ..row.clone()
+    };
+    let sections = sections_report_json(
+        &[
+            (AgentReportKind::Daily, vec![row.clone()]),
+            (AgentReportKind::Session, vec![priced_session]),
+        ],
+        AgentReportKind::Session,
+        false,
+    );
+    let sections = serde_json::to_value(&sections).unwrap();
+    assert!(
+        sections["totals"].get("unpricedModels").is_none(),
+        "sections totals follow the invoked section only"
+    );
+
+    let unpriced_session = AllRow {
+        period: "session-b".to_string(),
+        ..row.clone()
+    };
+    let sections = sections_report_json(
+        &[
+            (AgentReportKind::Daily, Vec::new()),
+            (AgentReportKind::Session, vec![unpriced_session]),
+        ],
+        AgentReportKind::Session,
+        false,
+    );
+    let sections = serde_json::to_value(&sections).unwrap();
+    assert_eq!(
+        sections["totals"]["unpricedModels"],
+        json!(["new-model"]),
+        "the invoked section's unpriced models reach totals"
+    );
+
+    row.model_breakdowns.remove(0);
+    let report = report_json(std::slice::from_ref(&row), AgentReportKind::Daily);
+    assert!(report["totals"].get("unpricedModels").is_none());
+}
+
+#[test]
 fn renders_by_agent_json_breakdowns_when_requested() {
     let rows = vec![AllRow {
         period: "2026-01-02".to_string(),
@@ -536,6 +643,85 @@ fn renders_multi_section_json_keys_in_invoked_section_order_with_totals_last() {
         serialized,
         r#"{"weekly":[],"daily":[],"monthly":[],"session":[],"totals":{"cacheCreationTokens":0,"cacheReadTokens":0,"inputTokens":0,"outputTokens":0,"totalCost":0,"totalTokens":0}}"#
     );
+}
+
+#[test]
+fn unified_sessions_sort_by_cost_in_json_and_table() {
+    let fixture = fs_fixture!({});
+    for (id, cost) in [("a-cheap", 1.0), ("m-medium", 3.0), ("z-expensive", 20.0)] {
+        let _ = fixture.write_file(
+            format!("projects/project-a/{id}.jsonl"),
+            json!({
+                "timestamp": "2099-01-02T00:00:00.000Z",
+                "sessionId": id,
+                "requestId": id,
+                "costUSD": cost,
+                "message": {
+                    "id": id,
+                    "model": "claude-sonnet-4-20250514",
+                    "usage": {"input_tokens": 100, "output_tokens": 50}
+                }
+            })
+            .to_string(),
+        );
+    }
+    let _env = isolated_agent_env(
+        &fixture,
+        "CLAUDE_CONFIG_DIR",
+        fixture.root().as_os_str().into(),
+    );
+    let shared = SharedArgs {
+        mode: CostMode::Display,
+        ..fixture_shared("20990101", "20990103")
+    };
+
+    for (order, order_explicit, expected) in [
+        (
+            crate::cli::SortOrder::Asc,
+            false,
+            ["z-expensive", "m-medium", "a-cheap"],
+        ),
+        (
+            crate::cli::SortOrder::Asc,
+            true,
+            ["a-cheap", "m-medium", "z-expensive"],
+        ),
+        (
+            crate::cli::SortOrder::Desc,
+            true,
+            ["z-expensive", "m-medium", "a-cheap"],
+        ),
+    ] {
+        let shared = SharedArgs {
+            order,
+            order_explicit,
+            ..shared.clone()
+        };
+        let result = load_rows(AgentReportKind::Session, &shared).unwrap();
+        let report = report_json(&result.rows, AgentReportKind::Session);
+        let ids: Vec<_> = report["session"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["period"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, expected);
+        assert_eq!(report["totals"]["totalCost"], 24.0);
+
+        let table = table_snapshot(
+            &result.rows,
+            AgentReportKind::Session,
+            &result.detected_agents,
+        );
+        let table_ids: Vec<_> = table["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["cells"][0].as_str().unwrap())
+            .collect();
+        assert_eq!(table_ids, [expected[0], expected[1], expected[2], "Total"]);
+        assert_daily_family_and_session_sections_match_standalone(&shared);
+    }
 }
 
 #[test]
@@ -957,6 +1143,7 @@ fn uses_non_cached_codex_input_tokens_in_all_rows() {
         &group,
         &PricingMap::default(),
         CodexSpeed::Standard,
+        CostMode::Calculate,
     );
 
     assert_eq!(row.input_tokens, 10);
@@ -1010,7 +1197,13 @@ fn includes_codex_model_breakdowns_in_all_rows() {
         },
     );
 
-    let row = codex_group_row("2026-01-02", &group, &pricing, CodexSpeed::Standard);
+    let row = codex_group_row(
+        "2026-01-02",
+        &group,
+        &pricing,
+        CodexSpeed::Standard,
+        CostMode::Calculate,
+    );
 
     assert_eq!(row.model_breakdowns.len(), 2);
     assert_eq!(row.model_breakdowns[0].model_name, "gpt-5");
@@ -1018,6 +1211,35 @@ fn includes_codex_model_breakdowns_in_all_rows() {
     assert_eq!(row.model_breakdowns[0].cache_read_tokens, 80);
     assert_eq!(row.model_breakdowns[0].output_tokens, 40);
     assert_eq!(row.model_breakdowns[1].model_name, "gpt-5-mini");
+}
+
+#[test]
+fn display_mode_omits_codex_missing_pricing_from_unified_json() {
+    let mut group = CodexGroup::default();
+    group.models.insert(
+        "gpt-unknown-preview".to_string(),
+        CodexModelUsage {
+            input_tokens: 100,
+            total_tokens: 100,
+            ..CodexModelUsage::default()
+        },
+    );
+    let row = codex_group_row(
+        "2026-01-02",
+        &group,
+        &PricingMap::default(),
+        CodexSpeed::Standard,
+        CostMode::Display,
+    );
+
+    let report = report_json(&[row], AgentReportKind::Daily);
+
+    assert!(report["totals"].get("unpricedModels").is_none());
+    assert!(
+        report["daily"][0]["modelBreakdowns"][0]
+            .get("missingPricing")
+            .is_none()
+    );
 }
 
 #[test]
@@ -1103,7 +1325,7 @@ fn aggregates_model_breakdowns_across_agents() {
 }
 
 #[test]
-fn displays_total_tokens_with_cache_tokens_like_typescript_table() {
+fn displays_total_tokens_including_extra_tokens() {
     let row = AllRow {
         period: "2026-01-02".to_string(),
         agent: "codex",
@@ -1112,7 +1334,7 @@ fn displays_total_tokens_with_cache_tokens_like_typescript_table() {
         output_tokens: 20,
         cache_creation_tokens: 0,
         cache_read_tokens: 10,
-        total_tokens: 120,
+        total_tokens: 135,
         total_cost: 0.01,
         metadata: None,
         metadata_agents: Some(vec!["codex"]),
@@ -1122,7 +1344,7 @@ fn displays_total_tokens_with_cache_tokens_like_typescript_table() {
 
     let cells = all_table_row(&row, false, false, false);
 
-    assert_eq!(cells[7], "130");
+    assert_eq!(cells[7], "135");
 }
 
 #[test]

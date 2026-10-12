@@ -10,6 +10,9 @@ mod report;
 mod speed;
 mod types;
 
+#[cfg(test)]
+mod compaction_tests;
+
 use crate::{PricingMap, Result, cli::AgentCommandArgs, log_level, print_json_or_jq, wants_json};
 
 pub use aggregate::{aggregate_events, filter_events_by_date, load_groups};
@@ -27,9 +30,9 @@ pub use types::{
 };
 pub(crate) use types::{CodexRawUsage, merge_codex_service_tiers};
 
-use report::{print_table_from_groups, report_from_groups};
+use report::{print_table_from_groups, report_from_groups, session_detail_json};
 
-use crate::cli::{AgentReportKind, CodexSpeed};
+use crate::cli::{AgentReportKind, CodexSpeed, CostMode};
 
 use serde_json::Value;
 
@@ -40,13 +43,76 @@ pub fn run(args: AgentCommandArgs) -> Result<()> {
         log_level() != Some(0),
         shared.pricing_overrides.iter(),
     );
-    let groups = load_groups(&shared, args.kind)?;
+    let mut groups = load_groups(&shared, args.kind)?;
     let speed = resolve_codex_speed(args.codex_speed);
+    if let Some(requested_id) = args.session_id {
+        let session_id = resolve_session_id(&groups, &requested_id)?.to_string();
+        if wants_json(&shared) {
+            let output = session_detail_json(
+                &session_id,
+                &groups[&session_id],
+                &pricing,
+                speed,
+                shared.mode,
+            );
+            return print_json_or_jq(output, shared.jq.as_deref(), shared.no_cost);
+        }
+        groups.retain(|id, _| id == &session_id);
+    }
     if wants_json(&shared) {
-        let output = report_from_groups(&groups, args.kind, &pricing, speed);
+        let output = report_from_groups(&groups, args.kind, &pricing, speed, shared.mode);
         return print_json_or_jq(output, shared.jq.as_deref(), shared.no_cost);
     }
     print_table_from_groups(&groups, args.kind, &pricing, speed, &shared)
+}
+
+fn resolve_session_id<'a>(
+    groups: &'a std::collections::BTreeMap<String, CodexGroup>,
+    requested_id: &str,
+) -> Result<&'a str> {
+    let original_id = requested_id;
+    let requested_id = original_id
+        .strip_prefix("codex://threads/")
+        .unwrap_or(original_id);
+    let requested_id = requested_id.strip_suffix(".jsonl").unwrap_or(requested_id);
+    let matches = groups
+        .keys()
+        .filter(|candidate| session_id_matches(candidate, requested_id))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [session_id] => Ok(session_id.as_str()),
+        [] => Err(cli_error(format!(
+            "No Codex session found with ID: {original_id}"
+        ))),
+        _ => Err(cli_error(format!(
+            "Codex session ID '{original_id}' is ambiguous and matches {} sessions.",
+            matches.len()
+        ))),
+    }
+}
+
+fn session_id_matches(candidate: &str, requested_id: &str) -> bool {
+    let candidate = candidate.strip_suffix(".jsonl").unwrap_or(candidate);
+    if candidate == requested_id
+        || candidate
+            .rsplit_once('/')
+            .map_or(candidate, |(_, file)| file)
+            == requested_id
+    {
+        return true;
+    }
+    is_codex_uuid(requested_id)
+        && candidate
+            .strip_suffix(requested_id)
+            .is_some_and(|prefix| prefix.ends_with('-'))
+}
+
+fn is_codex_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        })
 }
 
 #[doc(hidden)]
@@ -58,7 +124,13 @@ pub fn report_json(
     speed: CodexSpeed,
 ) -> Result<Value> {
     let groups = aggregate_events(events, kind, timezone)?;
-    Ok(report_from_groups(&groups, kind, pricing, speed.into()))
+    Ok(report_from_groups(
+        &groups,
+        kind,
+        pricing,
+        speed.into(),
+        CostMode::Calculate,
+    ))
 }
 
 #[cfg(test)]
@@ -72,6 +144,53 @@ mod tests {
     use crate::{CodexModelUsage, CodexServiceTier, CodexTokenUsageEvent, CodexUsageBucket};
     use ccusage_test_support::fs_fixture;
     use serde_json::json;
+
+    fn session_groups(ids: &[&str]) -> BTreeMap<String, CodexGroup> {
+        ids.iter()
+            .map(|id| ((*id).to_string(), CodexGroup::default()))
+            .collect()
+    }
+
+    #[test]
+    fn resolves_codex_session_from_supported_id_forms() {
+        let full_id = "2026/09/19/rollout-2026-09-19T23-22-40-01a0bb8c-c7c0-7630-9d82-860b875930f0";
+        let groups = session_groups(&[full_id]);
+
+        for requested in [
+            full_id,
+            "rollout-2026-09-19T23-22-40-01a0bb8c-c7c0-7630-9d82-860b875930f0",
+            "rollout-2026-09-19T23-22-40-01a0bb8c-c7c0-7630-9d82-860b875930f0.jsonl",
+            "01a0bb8c-c7c0-7630-9d82-860b875930f0",
+            "codex://threads/01a0bb8c-c7c0-7630-9d82-860b875930f0",
+        ] {
+            assert_eq!(resolve_session_id(&groups, requested).unwrap(), full_id);
+        }
+    }
+
+    #[test]
+    fn rejects_ambiguous_codex_session_uuid() {
+        let uuid = "01a0bb8c-c7c0-7630-9d82-860b875930f0";
+        let groups = session_groups(&[
+            "2026/09/19/rollout-2026-09-19T23-22-40-01a0bb8c-c7c0-7630-9d82-860b875930f0",
+            "2026/09/20/rollout-2026-09-20T10-00-00-01a0bb8c-c7c0-7630-9d82-860b875930f0",
+        ]);
+
+        let error = resolve_session_id(&groups, uuid).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!("Codex session ID '{uuid}' is ambiguous and matches 2 sessions.")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_codex_session_id() {
+        let groups = session_groups(&["2026/09/19/rollout-known"]);
+
+        let error = resolve_session_id(&groups, "missing").unwrap_err();
+
+        assert_eq!(error.to_string(), "No Codex session found with ID: missing");
+    }
 
     #[test]
     fn loads_directory_groups_with_date_filter_without_global_event_vector() {
@@ -131,6 +250,7 @@ mod tests {
         let report = report_json(
             &[CodexTokenUsageEvent {
                 session_id: "session-1".to_string(),
+                response_id: None,
                 timestamp: "2026-01-02T00:00:00.000Z".to_string(),
                 model: Some("gpt-5".to_string()),
                 input_tokens: 100,
@@ -180,6 +300,7 @@ mod tests {
         );
         let event = |timestamp: &str| CodexTokenUsageEvent {
             session_id: "session-1".to_string(),
+            response_id: None,
             timestamp: timestamp.to_string(),
             model: Some("deepseek-v4-flash".to_string()),
             input_tokens: 1_000_000,
@@ -263,6 +384,7 @@ mod tests {
             AgentReportKind::Daily,
             &PricingMap::load_embedded(),
             CodexSpeedPolicy::Forced(CodexServiceTier::Standard),
+            CostMode::Calculate,
         );
         let daily = &report["daily"][0];
         let model = &daily["models"]["gpt-5.6-terra"];
@@ -283,6 +405,30 @@ mod tests {
     }
 
     #[test]
+    fn prices_gpt_reserve_as_gpt_5_6_luna() {
+        let pricing = PricingMap::load_embedded();
+        let usage = CodexModelUsage {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            total_tokens: 1_100,
+            ..CodexModelUsage::default()
+        };
+
+        let reserve_cost =
+            calculate_codex_model_cost("gpt-reserve", &usage, &pricing, CodexSpeed::Standard);
+        let luna_cost =
+            calculate_codex_model_cost("gpt-5.6-luna", &usage, &pricing, CodexSpeed::Standard);
+
+        assert!(reserve_cost > 0.0);
+        assert_eq!(reserve_cost, luna_cost);
+        assert!(!codex_model_missing_pricing(
+            "gpt-reserve",
+            &usage,
+            &pricing
+        ));
+    }
+
+    #[test]
     fn reports_codex_model_aliases_without_raw_model_names() {
         let _aliases = crate::model_aliases::set_model_aliases_for_tests([
             ("private-codex-alpha", "gpt-5.5"),
@@ -293,6 +439,7 @@ mod tests {
             &[
                 CodexTokenUsageEvent {
                     session_id: "session-1".to_string(),
+                    response_id: None,
                     timestamp: "2026-01-02T00:00:00.000Z".to_string(),
                     model: Some("private-codex-alpha".to_string()),
                     input_tokens: 100,
@@ -306,6 +453,7 @@ mod tests {
                 },
                 CodexTokenUsageEvent {
                     session_id: "session-1".to_string(),
+                    response_id: None,
                     timestamp: "2026-01-02T00:00:01.000Z".to_string(),
                     model: Some("private-codex-beta".to_string()),
                     input_tokens: 50,
@@ -510,6 +658,47 @@ mod tests {
     }
 
     #[test]
+    fn applies_gpt_6_astra_fast_multiplier_without_changing_standard_cost() {
+        let pricing = PricingMap::load_embedded();
+        let usage = CodexModelUsage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 1_000_000,
+            total_tokens: 1_000_000,
+            long_context_input_tokens: 1_000_000,
+            long_context_cached_input_tokens: 1_000_000,
+            ..CodexModelUsage::default()
+        };
+
+        let standard =
+            calculate_codex_model_cost("gpt-6-astra", &usage, &pricing, CodexSpeed::Standard);
+        let fast = calculate_codex_model_cost("gpt-6-astra", &usage, &pricing, CodexSpeed::Fast);
+
+        assert!((standard - 2.0).abs() < f64::EPSILON);
+        assert!((fast - 4.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn applies_documented_gpt_6_fast_multipliers() {
+        let pricing = PricingMap::load_embedded();
+        let usage = CodexModelUsage {
+            input_tokens: 1_000_000,
+            cached_input_tokens: 500_000,
+            output_tokens: 100_000,
+            total_tokens: 1_100_000,
+            ..CodexModelUsage::default()
+        };
+
+        for model in ["gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"] {
+            let standard =
+                calculate_codex_model_cost(model, &usage, &pricing, CodexSpeed::Standard);
+            let fast = calculate_codex_model_cost(model, &usage, &pricing, CodexSpeed::Fast);
+
+            assert!(standard > 0.0, "{model} has embedded pricing");
+            assert!((fast - (standard * 2.0)).abs() < 1e-9, "{model}");
+        }
+    }
+
+    #[test]
     fn uses_recorded_service_tiers_in_auto_mode() {
         let mut pricing = PricingMap::default();
         pricing.load_json(
@@ -544,6 +733,135 @@ mod tests {
         assert!((auto - 30e-6).abs() < f64::EPSILON);
         assert!((forced_standard - 20e-6).abs() < f64::EPSILON);
         assert!((forced_fast - 40e-6).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn prices_recorded_flex_usage_at_flex_rate() {
+        let mut pricing = PricingMap::default();
+        pricing.load_json(
+            r#"{
+                "gpt-test": {
+                    "input_cost_per_token": 0.000001,
+                    "output_cost_per_token": 0.000002,
+                    "provider_specific_entry": { "flex": 0.5 }
+                }
+            }"#,
+        );
+        let usage = CodexModelUsage {
+            input_tokens: 20,
+            total_tokens: 20,
+            recorded_flex_usage: CodexUsageBucket {
+                input_tokens: 20,
+                ..CodexUsageBucket::default()
+            },
+            ..CodexModelUsage::default()
+        };
+
+        let cost = calculate_codex_model_cost("gpt-test", &usage, &pricing, CodexSpeed::Auto);
+
+        assert!((cost - 10e-6).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn prices_rollout_service_tiers_across_loading_and_report_modes() {
+        for (model, expected_costs) in [
+            ("gpt-test", [45e-6, 40e-6, 55e-6, 20e-6]),
+            ("deepseek-v4-flash", [9.9e-6, 8.8e-6, 12.1e-6, 4.4e-6]),
+        ] {
+            let rollout = |second: u8, tier: &str| {
+                let timestamp = format!("2026-08-16T17:00:{second:02}.000Z");
+                [
+                    json!({
+                        "timestamp": timestamp,
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "thread_settings_applied",
+                            "thread_settings": { "service_tier": tier },
+                        },
+                    })
+                    .to_string(),
+                    json!({
+                        "timestamp": timestamp,
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "info": {
+                                "model": model,
+                                "last_token_usage": {
+                                    "input_tokens": 10,
+                                    "output_tokens": 0,
+                                    "total_tokens": 10,
+                                },
+                            },
+                        },
+                    })
+                    .to_string(),
+                ]
+                .join("\n")
+            };
+            let fixture = fs_fixture!({
+                "sessions/standard.jsonl": rollout(1, "default"),
+                "sessions/flex.jsonl": rollout(2, "flex"),
+                "sessions/fast.jsonl": rollout(3, "priority"),
+                "sessions/unclassified.jsonl": rollout(4, "unknown"),
+            });
+            let mut pricing = PricingMap::default();
+            pricing.load_json(
+                &json!({
+                    model: {
+                        "input_cost_per_token": 0.000001,
+                        "output_cost_per_token": 0.000002,
+                        "provider_specific_entry": { "fast": 2, "flex": 0.5 },
+                    },
+                })
+                .to_string(),
+            );
+
+            for single_thread in [true, false] {
+                let shared = SharedArgs {
+                    single_thread,
+                    timezone: Some("UTC".to_string()),
+                    ..SharedArgs::default()
+                };
+                for kind in [
+                    AgentReportKind::Daily,
+                    AgentReportKind::Weekly,
+                    AgentReportKind::Monthly,
+                    AgentReportKind::Session,
+                ] {
+                    let groups =
+                        load_groups_from_directory(&fixture.path("sessions"), &shared, kind)
+                            .unwrap();
+                    for (speed, expected) in [
+                        (
+                            CodexSpeedPolicy::Auto(CodexServiceTier::Standard),
+                            expected_costs[0],
+                        ),
+                        (
+                            CodexSpeedPolicy::Auto(CodexServiceTier::Flex),
+                            expected_costs[1],
+                        ),
+                        (
+                            CodexSpeedPolicy::Auto(CodexServiceTier::Fast),
+                            expected_costs[2],
+                        ),
+                        (
+                            CodexSpeedPolicy::Forced(CodexServiceTier::Flex),
+                            expected_costs[3],
+                        ),
+                    ] {
+                        let report =
+                            report_from_groups(&groups, kind, &pricing, speed, CostMode::Calculate);
+                        assert_eq!(report["totals"]["totalTokens"], 40);
+                        let actual = report["totals"]["costUSD"].as_f64().unwrap();
+                        assert!(
+                            (actual - expected).abs() < 1e-12,
+                            "{model}: {actual} != {expected}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -694,6 +1012,7 @@ mod tests {
         let events = vec![
             CodexTokenUsageEvent {
                 session_id: "/workspace/api/session-a.jsonl".to_string(),
+                response_id: None,
                 timestamp: "2026-01-02T00:00:00.000Z".to_string(),
                 model: Some("gpt-5.3-codex".to_string()),
                 input_tokens: 140,
@@ -707,6 +1026,7 @@ mod tests {
             },
             CodexTokenUsageEvent {
                 session_id: "/workspace/api/session-a.jsonl".to_string(),
+                response_id: None,
                 timestamp: "2026-01-02T00:05:00.000Z".to_string(),
                 model: Some("gpt-5.3-codex".to_string()),
                 input_tokens: 70,
@@ -720,6 +1040,7 @@ mod tests {
             },
             CodexTokenUsageEvent {
                 session_id: "/workspace/web/session-b.jsonl".to_string(),
+                response_id: None,
                 timestamp: "2026-01-05T23:59:59.000Z".to_string(),
                 model: Some("gpt-5-mini".to_string()),
                 input_tokens: 10,
@@ -733,6 +1054,7 @@ mod tests {
             },
             CodexTokenUsageEvent {
                 session_id: "ignored-missing-model".to_string(),
+                response_id: None,
                 timestamp: "2026-01-06T00:00:00.000Z".to_string(),
                 model: None,
                 input_tokens: 999,

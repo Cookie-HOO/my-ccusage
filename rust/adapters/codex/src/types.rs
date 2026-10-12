@@ -16,6 +16,7 @@ pub struct CodexRawUsage {
 pub enum CodexServiceTier {
     Standard,
     Fast,
+    Flex,
 }
 
 pub const fn merge_codex_service_tiers(
@@ -32,6 +33,9 @@ pub const fn merge_codex_service_tiers(
         (Some(CodexServiceTier::Fast), _) | (_, Some(CodexServiceTier::Fast)) => {
             Some(CodexServiceTier::Fast)
         }
+        (Some(CodexServiceTier::Flex), _) | (_, Some(CodexServiceTier::Flex)) => {
+            Some(CodexServiceTier::Flex)
+        }
         (None, None) => None,
     }
 }
@@ -39,6 +43,7 @@ pub const fn merge_codex_service_tiers(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexTokenUsageEvent {
     pub session_id: String,
+    pub response_id: Option<String>,
     pub timestamp: String,
     pub model: Option<String>,
     pub input_tokens: u64,
@@ -49,6 +54,19 @@ pub struct CodexTokenUsageEvent {
     pub total_tokens: u64,
     pub is_fallback_model: bool,
     pub service_tier: Option<CodexServiceTier>,
+}
+
+impl CodexTokenUsageEvent {
+    pub(crate) fn raw_usage(&self) -> CodexRawUsage {
+        CodexRawUsage {
+            input_tokens: self.input_tokens,
+            cached_input_tokens: self.cached_input_tokens,
+            cache_creation_tokens: self.cache_creation_tokens,
+            output_tokens: self.output_tokens,
+            reasoning_output_tokens: self.reasoning_output_tokens,
+            total_tokens: self.total_tokens,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -68,6 +86,7 @@ pub struct CodexTimestampedUsage {
     pub(crate) usage: CodexUsageBucket,
     pub(crate) recorded_standard_usage: CodexUsageBucket,
     pub(crate) recorded_fast_usage: CodexUsageBucket,
+    pub(crate) recorded_flex_usage: CodexUsageBucket,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -89,6 +108,7 @@ pub struct CodexModelUsage {
     pub long_context_output_tokens: u64,
     pub recorded_standard_usage: CodexUsageBucket,
     pub recorded_fast_usage: CodexUsageBucket,
+    pub recorded_flex_usage: CodexUsageBucket,
     /// Exact event timestamps keep time-dependent pricing available after aggregation.
     pub timestamped_usage: BTreeMap<i64, CodexTimestampedUsage>,
     pub is_fallback: bool,
@@ -181,6 +201,14 @@ pub(super) struct CodexPayload<'a> {
     pub(super) model: Option<Cow<'a, str>>,
     #[serde(rename = "model_name", borrow, default)]
     pub(super) model_name: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    pub(super) response_id: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    pub(super) compaction_response_id: Option<Cow<'a, str>>,
+    #[serde(default, deserialize_with = "deserialize_optional_object_lossy")]
+    pub(super) usage: Option<CodexRawUsage>,
+    #[serde(default, deserialize_with = "deserialize_optional_object_lossy")]
+    pub(super) thread_token_usage: Option<CodexRawUsage>,
     #[serde(
         borrow,
         default,

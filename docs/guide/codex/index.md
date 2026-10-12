@@ -37,7 +37,7 @@ CODEX_HOME="$HOME/.codex,$HOME/.codex-work,$HOME/codex-exec-logs" ccusage codex 
 | `ccusage codex monthly` | Aggregate usage by month     | [Monthly Usage](/guide/monthly-reports) |
 | `ccusage codex session` | Group usage by Codex session | [Session Usage](/guide/session-reports) |
 
-These views support `--json`, `--compact`, `--offline`, and `--speed auto|standard|fast`.
+These views support `--json`, `--compact`, `--offline`, and `--speed auto|standard|flex|fast`.
 
 ## Monthly Example
 
@@ -46,13 +46,16 @@ These views support `--json`, `--compact`, `--offline`, and `--speed auto|standa
 ## What Gets Calculated
 
 - **Token deltas** – Each `event_msg` with `payload.type === "token_count"` reports cumulative totals and, when available, the latest request delta. Current MultiAgent V2 subagent rollouts can persist a replayed parent-history prefix; the CLI uses the final inherited snapshot as the child baseline, then counts only advancing usage from the child turn. Older Codex replay formats retain timestamp-based compatibility handling.
+- **Automatic compaction** – Codex can record remote compaction requests separately from cumulative token counts. ccusage includes a `token_usage_record` only when its response ID matches a `compacted` record and the intervening token-count snapshot has not already accounted for it. Copied response IDs are counted once across reports, including when the parent session is outside the selected date range. A missing model uses the active `turn_context` and is marked as a fallback estimate. Additional compaction usage does not change the normal cumulative baseline.
 - **Per-model grouping** – The active `turn_context` specifies the model for newly counted usage. Replayed parent contexts in current MultiAgent V2 subagent prefixes remain inherited history and do not add model usage to the child. We aggregate tokens per day/month and per model. Sessions lacking model metadata (seen in early September 2025 builds) are skipped.
-- **Pricing** – Rates come from LiteLLM's pricing dataset via the shared `LiteLLMPricingFetcher`. Codex's internal review label is resolved to the newest known model for the log date before pricing is calculated.
+- **Pricing** – Rates come from LiteLLM's pricing dataset via the shared `LiteLLMPricingFetcher`. Codex's internal review label uses the manually curated, date-based fallback timeline below and remains marked as approximate.
 - **Scheduled pricing** – DeepSeek V4 Flash and Pro use each event's timestamp: legacy rates apply before `2026-08-16T16:00:00Z`, and the later rates use UTC weekday peak windows of `01:00–04:00` and `06:00–10:00` (endpoints excluded). Cache creation follows the scheduled input rate.
-- **Speed pricing** – `--speed auto` is the default. For rollouts written by Codex CLI 0.144.0 and later, ccusage applies recorded `thread_settings_applied` tier changes chronologically: `priority` and legacy `fast` use Fast pricing, while `default` uses Standard pricing. Unmarked usage falls back to `config.toml` detection. Pass `--speed fast` or `--speed standard` to override every recorded tier. Fast pricing uses a model-specific multiplier only when one is available; otherwise, ccusage keeps standard pricing rather than inventing a rate.
+- **Speed pricing** uses `--speed auto` by default. For rollouts written by Codex CLI 0.144.0 and later, ccusage applies recorded `thread_settings_applied` tier changes chronologically. `priority` and legacy `fast` use Fast pricing, `flex` uses Flex pricing, and `default` or `standard` uses Standard pricing. Unmarked usage falls back to `config.toml` detection. Pass `--speed standard`, `--speed flex`, or `--speed fast` to override every recorded tier. Fast and Flex pricing use model-specific multipliers only when one is available; otherwise, ccusage keeps standard pricing rather than inventing a rate.
 - **Legacy fallback** – Early September 2025 logs that never recorded `turn_context` metadata are still included; the CLI assumes `gpt-5` for pricing so you can review the tokens even though the model tag is missing (the JSON output also marks these rows with `"isFallback": true`).
 - **Cost formula** – Non-cached input uses the standard input price; cached input uses the cache-read price (falling back to the input price when missing); and output tokens are billed at the output price. All prices are per million tokens. Reasoning tokens may be shown for reference, but they are part of the output charge and are not billed separately.
 - **Totals and reports** – Daily, monthly, and session views display per-model breakdowns, overall totals, and optional JSON for automation.
+
+Reports are reconstructed from retained local logs. Missing compaction usage records cannot be recovered from their markers alone, and local totals can differ from account-wide Codex usage. Pricing aliases such as `gpt-reserve` affect cost estimates, without changing token totals or revealing an unrecorded backend model.
 
 ## Environment Variables
 
@@ -61,15 +64,19 @@ These views support `--json`, `--compact`, `--offline`, and `--speed auto|standa
 | `CODEX_HOME` | Override the root directory, or comma-separated directories, containing Codex homes or saved `codex exec --json` JSONL files |
 | `LOG_LEVEL`  | Adjust log verbosity (0 silent … 5 trace)                                                                                    |
 
-When Codex emits a model alias, the CLI automatically resolves it through the LiteLLM pricing data when possible. For `codex-auto-review`, the Codex parser maps the label to the newest known Codex/OpenAI model available on the log date using a pinned models.dev snapshot before pricing uses the resolved model name. No manual override is needed.
+When Codex emits a model alias, the CLI automatically resolves it through the LiteLLM pricing data when possible. The built-in `gpt-reserve` alias is priced as `gpt-5.6-luna`. Codex logs retain `codex-auto-review` as a routing alias rather than recording its effective model, so ccusage applies a manually curated, best-effort timeline and marks the result with `"isFallback": true`. Based on OpenAI's [July 30, 2026 Auto-review migration announcement](https://community.openai.com/t/announcing-a-major-price-drop-for-5-6-terra-and-luna-and-fast-mode-for-5-6-sol/1388484), records from that date onward resolve to `gpt-5.6-luna`, while records from March 5 through July 29 resolve to `gpt-5.4`. Server-side routing or catalog overrides can still differ from this estimate.
 
 ## Speed Pricing
 
-By default, `ccusage codex` uses `--speed auto`. Codex CLI 0.144.0 and later can persist `thread_settings_applied` events in session rollouts. ccusage associates each token event with the most recent recognized setting: `service_tier = "priority"` or legacy `"fast"` is Fast, and `"default"` is Standard. This supports sessions that switch modes over time instead of applying one multiplier to the entire day or session.
+By default, `ccusage codex` uses `--speed auto`. Codex CLI 0.144.0 and later can persist `thread_settings_applied` events in session rollouts. ccusage associates each token event with the most recent recognized setting. `service_tier = "priority"` or legacy `"fast"` is Fast, `"flex"` is Flex, and `"default"` or `"standard"` is Standard. This supports sessions that switch modes over time instead of applying one multiplier to the entire day or session.
 
-Some usage remains unclassified, including older rollouts, saved headless `codex exec --json` output, and startup usage before the first persisted settings event. For only that unclassified portion, auto mode reads `config.toml` from each `CODEX_HOME` root and uses Fast when any root has `service_tier = "priority"` or legacy `service_tier = "fast"`; otherwise it uses Standard. An unsupported recorded tier is also left unclassified rather than inheriting a stale Fast value. Explicit `--speed fast` and `--speed standard` override all recorded and fallback tiers.
+Some usage remains unclassified, including older rollouts, saved headless `codex exec --json` output, and startup usage before the first persisted settings event. For only that unclassified portion, auto mode reads `config.toml` from each `CODEX_HOME` root and uses Fast when any root has `service_tier = "priority"` or legacy `service_tier = "fast"`. If no root requests Fast and a root requests `service_tier = "flex"`, it uses Flex. Otherwise it uses Standard. An unsupported recorded tier is also left unclassified rather than inheriting a stale tier. Explicit `--speed standard`, `--speed flex`, and `--speed fast` override all recorded and fallback tiers.
 
-Fast pricing uses a model-specific multiplier only when one is published. GPT-5.6 Sol, Terra, and Luna use the [documented 2× API Priority rate](https://learn.chatgpt.com/docs/agent-configuration/speed#fast-mode). This is distinct from the 2.5× ChatGPT credit-consumption rate shown for GPT-5.6 Fast mode: ccusage's `costUSD` is an API-equivalent estimate, not a ChatGPT credit balance. When a model's Fast rate is unknown, ccusage reports standard pricing rather than assuming a multiplier, which may underestimate actual Fast usage.
+Fallback detection reads the top-level `service_tier` and lets a named profile override it only when `profile = "name"` selects that profile in `config.toml`. Inactive profiles are ignored, and a selected profile without its own tier inherits the top-level setting. If Codex selected a profile through `--profile` or another configuration file, use an explicit `--speed` for unclassified usage because ccusage cannot infer that selection from `config.toml`.
+
+Fast and Flex pricing use model-specific multipliers only when one is published. GPT-5.6 Sol, Terra, and Luna use the [documented 2× API Priority rate](https://learn.chatgpt.com/docs/agent-configuration/speed#fast-mode), and GPT-6 [Astra](https://developers.openai.com/api/docs/models/gpt-6-astra), [Sol](https://developers.openai.com/api/docs/models/gpt-6-sol), and [Luna](https://developers.openai.com/api/docs/models/gpt-6-luna) and [GPT-6.1 Sol](https://developers.openai.com/api/docs/models/gpt-6.1-sol) use their documented 2× Fast rates. Models listed in OpenAI's [Flex pricing table](https://developers.openai.com/api/docs/pricing) use 0.5× Standard pricing, including dated and provider-qualified names. These are distinct from ChatGPT credit-consumption rates. ccusage's `costUSD` is an API-equivalent estimate, not a ChatGPT credit balance. When a model's Fast or Flex rate is unknown, ccusage reports standard pricing rather than assuming a multiplier, which may underestimate Fast usage or overestimate Flex usage.
+
+Use [`pricingOverrides`](/guide/config-files#pricing-overrides) to configure a model's `fastMultiplier` or `flexMultiplier`.
 
 ```bash
 # Default: use recorded tiers, then config.toml for unmarked usage
@@ -77,6 +84,9 @@ ccusage codex daily --speed auto
 
 # Force fast pricing
 ccusage codex daily --speed fast
+
+# Force Flex pricing
+ccusage codex daily --speed flex
 
 # Force standard pricing
 ccusage codex daily --speed standard
@@ -92,7 +102,7 @@ ccusage codex monthly --json
 ccusage codex session --json
 ```
 
-Session JSON includes per-model breakdowns, cached token counts, `lastActivity`, and `isFallback` flags for any events that required the legacy `gpt-5` pricing fallback.
+Session JSON includes per-model breakdowns, cached token counts, `lastActivity`, and `isFallback` flags for events that required either the legacy `gpt-5` pricing fallback or the manually curated `codex-auto-review` timeline.
 
 Have feedback or ideas? [Open an issue](https://github.com/ccusage/ccusage/issues/new) so we can improve Codex support.
 

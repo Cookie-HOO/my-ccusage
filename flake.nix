@@ -3,8 +3,13 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    pnpm-nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    # Tirith 0.4 rejects existing shell and Nushell workflow bodies as incomplete.
+    # Keep the last working scanner independent of routine nixpkgs updates.
+    tirith-nixpkgs.url = "github:NixOS/nixpkgs/91cc1fdf6831e29b6c98768e721a72241f3d0797";
     bun2nix = {
-      url = "github:nix-community/bun2nix";
+      # Released bun2nix rejects the lockfile format written by current Bun.
+      url = "github:nix-community/bun2nix/0456acb1b7394fc14c414b056aa889df5124943a";
       inputs.nixpkgs.follows = "nixpkgs";
     };
     crane.url = "github:ipetkov/crane";
@@ -53,6 +58,8 @@
         ./nix/treefmt.nix
         ./nix/git-hooks.nix
         ./nix/packages.nix
+        ./nix/pnpm.nix
+        ./nix/tirith.nix
         ./nix/static-package.nix
         ./nix/darwin-x64-package.nix
         ./nix/tests.nix

@@ -41,6 +41,7 @@ impl RootAllOptions {
         AgentCommandArgs {
             shared,
             kind,
+            session_id: None,
             sections: self.sections,
             by_agent: self.by_agent,
             pi_path: None,
@@ -123,6 +124,9 @@ impl Cli {
             return Err(format!("Unexpected argument '{extra}'"));
         }
         if let Some(message) = last_option_error(command.as_ref(), &shared) {
+            return Err(message);
+        }
+        if let Some(message) = date_window_error(command.as_ref(), &shared) {
             return Err(message);
         }
         Ok(Self { command, shared })
@@ -215,6 +219,7 @@ fn parse_command(
         "statusline" => {
             let mut args = StatuslineArgs::default();
             config.apply_statusline_args(&mut args);
+            args.timezone = shared.timezone.clone();
             while parser.peek().is_some() {
                 match parser.next_flag()?.as_str() {
                     "-O" | "--offline" => args.offline = true,
@@ -418,6 +423,7 @@ fn parse_all_command(
     Ok(Command::All(AgentCommandArgs {
         shared,
         kind,
+        session_id: None,
         sections,
         by_agent,
         pi_path: None,
@@ -461,6 +467,7 @@ fn parse_top_level_session_command(
     Ok(Command::All(AgentCommandArgs {
         shared: args.shared,
         kind: AgentReportKind::Session,
+        session_id: None,
         sections,
         by_agent,
         pi_path: None,
@@ -605,6 +612,7 @@ fn parse_codex_command(
 ) -> Result<Command, String> {
     let kind = parse_agent_report_kind(parser, "codex", STANDARD_AGENT_REPORTS)?;
     let mut codex_speed = CodexSpeed::Auto;
+    let mut session_id = None;
     config.apply_agent_args(&mut codex_speed, None, None);
     while parser.peek().is_some() {
         if parse_shared_arg_for_command(parser, &mut shared)? {
@@ -612,12 +620,16 @@ fn parse_codex_command(
         }
         match parser.next_flag()?.as_str() {
             "--speed" => codex_speed = parse_codex_speed(&parser.value_for("--speed")?)?,
+            "-i" | "--id" if kind == AgentReportKind::Session => {
+                session_id = Some(parser.value_for("--id")?)
+            }
             flag => return Err(format!("Unknown codex option '{flag}'")),
         }
     }
     Ok(Command::Codex(AgentCommandArgs {
         shared,
         kind,
+        session_id,
         sections: None,
         by_agent: false,
         pi_path: None,
@@ -647,6 +659,7 @@ fn parse_pi_command(
     Ok(Command::Pi(AgentCommandArgs {
         shared,
         kind,
+        session_id: None,
         sections: None,
         by_agent: false,
         pi_path,
@@ -676,6 +689,7 @@ fn parse_openclaw_command(
     Ok(Command::OpenClaw(AgentCommandArgs {
         shared,
         kind,
+        session_id: None,
         sections: None,
         by_agent: false,
         pi_path: None,
@@ -706,6 +720,7 @@ fn agent_command_args(shared: SharedArgs, kind: AgentReportKind) -> AgentCommand
     AgentCommandArgs {
         shared,
         kind,
+        session_id: None,
         sections: None,
         by_agent: false,
         pi_path: None,
@@ -746,7 +761,10 @@ fn parse_shared_arg(parser: &mut ArgParser, shared: &mut SharedArgs) -> Result<(
                 .parse()
                 .map_err(|_| "Invalid value for --debug-samples".to_string())?
         }
-        "-o" | "--order" => shared.order = parse_sort_order(&parser.value_for("--order")?)?,
+        "-o" | "--order" => {
+            shared.order = parse_sort_order(&parser.value_for("--order")?)?;
+            shared.order_explicit = true;
+        }
         "-b" | "--breakdown" => shared.breakdown = true,
         "-O" | "--offline" => shared.offline = true,
         "--no-offline" => shared.no_offline = true,
@@ -1047,10 +1065,14 @@ fn parse_last_periods(value: &str) -> Result<u32, String> {
     }
 }
 
-/// `--last` counts the report's own calendar periods, so it only makes sense on
-/// the reports that group rows by day, week, or month.
-fn last_option_error(command: Option<&Command>, root_shared: &SharedArgs) -> Option<String> {
-    let (shared, supported) = match command {
+/// The shared options that apply to a command (statusline falls back to the root
+/// options), plus whether that command groups rows by a calendar period (day,
+/// week, or month).
+fn report_shared<'a>(
+    command: Option<&'a Command>,
+    root_shared: &'a SharedArgs,
+) -> (&'a SharedArgs, bool) {
+    match command {
         None => (root_shared, true),
         Some(Command::All(args)) => (&args.shared, args.kind != AgentReportKind::Session),
         Some(Command::Daily(args)) => (&args.shared, true),
@@ -1079,7 +1101,13 @@ fn last_option_error(command: Option<&Command>, root_shared: &SharedArgs) -> Opt
             | Command::Dsh(args)
             | Command::ZCode(args),
         ) => (&args.shared, args.kind != AgentReportKind::Session),
-    };
+    }
+}
+
+/// `--last` counts the report's own calendar periods, so it only makes sense on
+/// the reports that group rows by day, week, or month.
+fn last_option_error(command: Option<&Command>, root_shared: &SharedArgs) -> Option<String> {
+    let (shared, supported) = report_shared(command, root_shared);
     shared.last?;
     if !supported {
         return Some(
@@ -1094,6 +1122,20 @@ fn last_option_error(command: Option<&Command>, root_shared: &SharedArgs) -> Opt
         return Some("The --last option cannot be used with --sections.".to_string());
     }
     None
+}
+
+/// Both bounds are already normalized to `YYYYMMDD`, so a plain string comparison
+/// orders them. A reversed window would otherwise load everything and print an
+/// empty report that looks like missing data.
+fn date_window_error(command: Option<&Command>, root_shared: &SharedArgs) -> Option<String> {
+    if matches!(command, Some(Command::Statusline(_))) {
+        return None;
+    }
+    let (shared, _) = report_shared(command, root_shared);
+    let since = shared.since.as_deref()?;
+    let until = shared.until.as_deref()?;
+    (since > until)
+        .then(|| format!("The --since date '{since}' is later than the --until date '{until}'."))
 }
 
 fn parse_cost_mode(value: &str) -> Result<CostMode, String> {
@@ -1161,6 +1203,7 @@ fn parse_codex_speed(value: &str) -> Result<CodexSpeed, String> {
         "auto" => Ok(CodexSpeed::Auto),
         "standard" => Ok(CodexSpeed::Standard),
         "fast" => Ok(CodexSpeed::Fast),
+        "flex" => Ok(CodexSpeed::Flex),
         _ => Err(format!("Invalid speed option '{value}'")),
     }
 }

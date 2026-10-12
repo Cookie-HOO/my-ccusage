@@ -18,14 +18,31 @@ Relevant JSONL event:
 - `payload.info.last_token_usage` is the current turn delta.
 - If only cumulative totals exist, subtract prior totals to recover deltas.
 
+Automatic compaction usage is recorded separately:
+
+- A top-level `token_usage_record` carries `payload.response_id` and `payload.usage`.
+- Count it only when its response ID matches a `compacted` item's `payload.compaction_response_id`, in either record order.
+- Local compactions also emit an advancing `token_count` between the response record and marker. When that snapshot accounts for the record's request usage or matches its cumulative `thread_token_usage`, do not add the usage again. Remote v2 compactions lack this advance.
+- Keep its request timestamp and recorded service tier. Missing model metadata uses the active `turn_context` and marks the attribution as a fallback.
+- Compaction usage does not advance the normal cumulative baseline or change the active turn model.
+- Deduplicate copied compactions by response ID, independently of normal token-count replay matching. Retain the first file's session, timestamp, and model attribution even when files are parsed in parallel; merge service tiers across copies.
+- Preserve all matched parent compaction IDs in the replay plan, including usage already covered by a cumulative snapshot, so a date-bounded child report does not count a copied request when its parent lies outside the report range.
+
 Relevant speed-setting event in Codex CLI 0.144.0 and later:
 
 - `type === "event_msg"`
 - `payload.type === "thread_settings_applied"`
 - `payload.thread_settings.service_tier === "priority"` (or legacy `"fast"`) selects Fast.
+- `payload.thread_settings.service_tier === "flex"` selects Flex.
 - `payload.thread_settings.service_tier === "default"` selects Standard. Codex Desktop spells the same tier `"standard"`; both appear in the same CLI version, so this is a value mapping and not a version split.
 - Token usage inherits the latest recognized setting in the rollout. A settings event without a `service_tier` key leaves the previous tier in place (auto-review threads emit these); a tier that is present but unrecognized clears it so a stale value is not inherited.
 - `thread_settings_applied` is not emitted per turn, so short rollouts carry no tier at all and stay unclassified for report policy to resolve.
+
+Unclassified usage uses the top-level `service_tier` in each Codex home's
+`config.toml`, overridden by a legacy named profile only when the top-level
+`profile` selects it. Inactive profiles and tier-like text inside strings do not
+affect pricing. Profile selections made through CLI flags or separate profile
+files require an explicit `--speed` override for unclassified usage.
 
 Relevant MultiAgent V2 subagent replay markers:
 
@@ -44,3 +61,5 @@ Token mapping:
 - `total_tokens` - provided directly or recomputed as input plus output for legacy entries.
 
 Pricing uses model metadata from `turn_context`. Early sessions without metadata fall back to `gpt-5`, mark `isFallbackModel === true`, and expose fallback rows as approximate in aggregate JSON.
+
+`codex-auto-review` is a server-routed alias and does not expose its effective model in the log. The adapter uses a manually curated timeline for API-equivalent cost estimates and keeps those events marked as fallback models. OpenAI announced a GPT-5.4 to GPT-5.6 Luna transition on 2026-07-30, so events from that date onward resolve to `gpt-5.6-luna`; events from 2026-03-05 through 2026-07-29 resolve to `gpt-5.4`. Server-side routing or catalog overrides can make the effective model differ from this estimate.

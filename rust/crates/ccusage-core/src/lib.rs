@@ -11,6 +11,10 @@ pub mod model_aliases;
 pub mod output;
 pub mod path_utils;
 pub mod pricing;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../build.rs"]
+mod pricing_snapshot;
 pub mod progress;
 pub mod project_names;
 pub mod summary;
@@ -31,15 +35,16 @@ pub use date_utils::*;
 pub use last_window::{PeriodUnit, last_periods_since};
 pub use logger::{debug_log, log_level};
 pub use output::{
-    UsageTableOptions, format_currency, format_models_multiline, format_number,
-    group_project_output, json_float, print_json_or_jq, print_missing_pricing_warnings,
-    print_missing_pricing_warnings_for_models, print_usage_table, print_usage_table_with_options,
-    sanitize_terminal_text, session_summary_json, should_use_compact_layout, summary_json,
-    totals_json, wants_json,
+    UsageTableOptions, attach_unpriced_models, format_currency, format_models_multiline,
+    format_number, group_project_output, json_float, print_json_or_jq,
+    print_missing_pricing_warnings, print_missing_pricing_warnings_for_models, print_usage_table,
+    print_usage_table_with_options, sanitize_terminal_text, session_summary_json,
+    should_use_compact_layout, summary_json, totals_json, unpriced_models, wants_json,
 };
 pub use pricing::{Pricing, PricingMap, has_time_dependent_pricing};
 pub(crate) use project_names::parse_project_aliases;
-pub use project_names::{format_project_name, short_model_name};
+pub(crate) use project_names::short_model_name;
+pub use project_names::{format_breakdown_model_label, format_project_name};
 pub use summary::{
     BucketKind, SessionAccumulator, filter_and_sort_summaries, sort_summaries, summarize_by_key,
     summarize_summaries_by_bucket, week_start,

@@ -14,7 +14,7 @@ use crate::{
         amp, antigravity, claude, codebuff, codex, copilot, droid, dsh, gemini, goose, grok,
         hermes, kilo, kimi, openclaw, opencode, pi, qwen, zcode,
     },
-    cli::{AgentReportKind, CodexSpeed, NamedPiStore, SharedArgs, WeekDay},
+    cli::{AgentReportKind, CodexSpeed, CostMode, NamedPiStore, SharedArgs, WeekDay},
     filter_loaded_entries_by_date, json_float,
 };
 
@@ -415,7 +415,17 @@ fn finish_rows(kind: AgentReportKind, mut rows: Vec<AllRow>, shared: &SharedArgs
         for row in &mut rows {
             row.metadata_agents = None;
         }
-        sort_rows(&mut rows, &shared.order);
+        rows.sort_by(|a, b| {
+            let cost_order = if shared.order_explicit && shared.order == crate::cli::SortOrder::Asc
+            {
+                a.total_cost.total_cmp(&b.total_cost)
+            } else {
+                b.total_cost.total_cmp(&a.total_cost)
+            };
+            cost_order
+                .then_with(|| a.period.cmp(&b.period))
+                .then_with(|| a.agent.cmp(b.agent))
+        });
         return rows;
     }
 
@@ -647,8 +657,10 @@ fn load_claude_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<AgentR
         });
     }
 
-    let mut summaries = claude::load_daily_summaries(shared, None, false)?;
-    let detected = !summaries.is_empty();
+    let claude::DailySummaries {
+        mut summaries,
+        detected,
+    } = claude::load_daily_summaries_with_detection(shared, None, false)?;
     filter_daily_summaries_by_date(&mut summaries, shared);
     Ok(AgentRows {
         rows: summary_rows("claude", summaries, false),
@@ -679,7 +691,7 @@ fn load_codex_rows(
         return Ok(AgentRows {
             rows: groups
                 .iter()
-                .map(|(period, group)| codex_group_row(period, group, pricing, speed))
+                .map(|(period, group)| codex_group_row(period, group, pricing, speed, shared.mode))
                 .collect(),
             detected,
         });
@@ -692,7 +704,7 @@ fn load_codex_rows(
     Ok(AgentRows {
         rows: groups
             .iter()
-            .map(|(period, group)| codex_group_row(period, group, pricing, speed))
+            .map(|(period, group)| codex_group_row(period, group, pricing, speed, shared.mode))
             .collect(),
         detected,
     })
@@ -786,7 +798,8 @@ fn summary_rows(
                 .or(summary.session_id.as_ref())?
                 .clone();
             let total_tokens = summary.total_tokens();
-            if total_tokens == 0 {
+            // Cost-only rows, such as Copilot credits missing from modelMetrics, still bill.
+            if total_tokens == 0 && summary.total_cost == 0.0 {
                 return None;
             }
             let metadata = summary_metadata(&summary, include_project_path);
@@ -834,6 +847,7 @@ pub(super) fn codex_group_row<S>(
     group: &CodexGroup,
     pricing: &PricingMap,
     speed: S,
+    mode: CostMode,
 ) -> AllRow
 where
     S: Into<codex::CodexSpeedPolicy> + Copy,
@@ -856,7 +870,8 @@ where
                 cache_read_tokens: usage.cached_input_tokens,
                 extra_total_tokens: 0,
                 cost: codex::calculate_codex_model_cost(model, usage, pricing, speed),
-                missing_pricing: codex::codex_model_missing_pricing(model, usage, pricing),
+                missing_pricing: mode != CostMode::Display
+                    && codex::codex_model_missing_pricing(model, usage, pricing),
             }
         })
         .collect();
@@ -937,6 +952,117 @@ mod tests {
         }
     }
 
+    fn sorting_row(period: &str, agent: &'static str, cost: f64) -> AllRow {
+        let mut summary = usage_summary(period, 10);
+        summary.total_cost = cost;
+        summary_rows(agent, vec![summary], false).pop().unwrap()
+    }
+
+    #[test]
+    fn session_cost_order_honors_explicit_ascending_order() {
+        let shared = SharedArgs {
+            order: crate::cli::SortOrder::Asc,
+            order_explicit: true,
+            ..SharedArgs::default()
+        };
+        let rows = vec![
+            sorting_row("a-expensive", "claude", 20.0),
+            sorting_row("z-cheap", "codex", 1.0),
+            sorting_row("z-cheap", "claude", 1.0),
+            sorting_row("b-zero", "claude", 0.0),
+        ];
+        let sorted = finish_rows(AgentReportKind::Session, rows, &shared);
+        let keys: Vec<_> = sorted
+            .iter()
+            .map(|row| (row.period.as_str(), row.agent))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                ("b-zero", "claude"),
+                ("z-cheap", "claude"),
+                ("z-cheap", "codex"),
+                ("a-expensive", "claude")
+            ]
+        );
+    }
+
+    #[test]
+    fn session_cost_order_uses_id_then_agent_for_ties() {
+        for (order, order_explicit) in [
+            (crate::cli::SortOrder::Asc, false),
+            (crate::cli::SortOrder::Desc, true),
+        ] {
+            let rows = vec![
+                sorting_row("b-tie", "codex", 20.0),
+                sorting_row("a-zero", "claude", 0.0),
+                sorting_row("z-tie", "claude", 20.0),
+                sorting_row("b-tie", "claude", 20.0),
+                sorting_row("c-cheap", "codex", 1.0),
+            ];
+            let shared = SharedArgs {
+                order,
+                order_explicit,
+                ..SharedArgs::default()
+            };
+            let sorted = finish_rows(AgentReportKind::Session, rows, &shared);
+            let keys: Vec<_> = sorted
+                .iter()
+                .map(|row| (row.period.as_str(), row.agent))
+                .collect();
+            assert_eq!(
+                keys,
+                [
+                    ("b-tie", "claude"),
+                    ("b-tie", "codex"),
+                    ("z-tie", "claude"),
+                    ("c-cheap", "codex"),
+                    ("a-zero", "claude"),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn session_cost_order_handles_empty_and_single_row_reports() {
+        let shared = SharedArgs::default();
+        assert!(finish_rows(AgentReportKind::Session, Vec::new(), &shared).is_empty());
+        let rows = finish_rows(
+            AgentReportKind::Session,
+            vec![sorting_row("only-session", "claude", 0.0)],
+            &shared,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].period, "only-session");
+    }
+
+    #[test]
+    fn period_reports_keep_chronological_order_regardless_of_cost() {
+        for kind in [
+            AgentReportKind::Daily,
+            AgentReportKind::Weekly,
+            AgentReportKind::Monthly,
+        ] {
+            for (order, expected_costs) in [
+                (crate::cli::SortOrder::Asc, [1.0, 20.0, 3.0]),
+                (crate::cli::SortOrder::Desc, [3.0, 20.0, 1.0]),
+            ] {
+                let rows = vec![
+                    sorting_row("2026-03-02", "claude", 3.0),
+                    sorting_row("2026-01-05", "claude", 1.0),
+                    sorting_row("2026-02-02", "claude", 20.0),
+                ];
+                let shared = SharedArgs {
+                    order,
+                    ..SharedArgs::default()
+                };
+                let sorted = finish_rows(kind, rows, &shared);
+                let costs: Vec<_> = sorted.iter().map(|row| row.total_cost).collect();
+                assert_eq!(costs, expected_costs, "{kind:?} {order:?}");
+            }
+        }
+    }
+
     #[test]
     fn filters_daily_summaries_with_compact_date_bounds() {
         let mut rows = vec![
@@ -991,7 +1117,7 @@ mod tests {
         let speed = codex::CodexSpeedPolicy::Auto(codex::CodexServiceTier::Standard);
 
         let focused_cost = codex::calculate_group_cost(&group, &pricing, speed);
-        let unified = codex_group_row("2026-07-22", &group, &pricing, speed);
+        let unified = codex_group_row("2026-07-22", &group, &pricing, speed, CostMode::Calculate);
 
         assert!((focused_cost - 40e-6).abs() < f64::EPSILON);
         assert!((unified.total_cost - focused_cost).abs() < f64::EPSILON);
@@ -1028,6 +1154,7 @@ mod tests {
             &group,
             &pricing,
             codex::CodexSpeedPolicy::Forced(codex::CodexServiceTier::Standard),
+            CostMode::Calculate,
         );
         let expected_cost =
             2_124.0 * 4e-6 + 875_306.0 * 0.4e-6 + 57_610.0 * 5e-6 + 11_150.0 * 18e-6;
