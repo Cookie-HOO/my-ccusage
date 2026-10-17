@@ -23,6 +23,47 @@
 
 > Analyze coding (agent) CLI token usage and costs from local data.
 
+> [!IMPORTANT]
+> This repository is an unofficial distribution of ccusage with the
+> [DeepSeek Harness (DSH) adapter](https://github.com/oksure/ccusage/tree/contrib/dsh-usage-adapter).
+> It publishes pinned native binaries for Windows, macOS, and Linux. For the
+> official project and npm package, see [`ccusage/ccusage`](https://github.com/ccusage/ccusage).
+
+## Install this DSH build
+
+### Windows x64
+
+Run in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Cookie-HOO/ccusage-dsh/main/install.ps1 | iex
+ccusage-dsh dsh daily
+```
+
+The installer verifies the release SHA-256 checksum, installs
+`ccusage-dsh.exe` under `%LOCALAPPDATA%\Programs\ccusage-dsh`, and adds that
+folder to the user `PATH`. Open a new terminal if the command is not immediately
+available.
+
+### macOS and Linux
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Cookie-HOO/ccusage-dsh/main/install.sh | sh
+ccusage-dsh dsh daily
+```
+
+The installer verifies the release checksum and installs to
+`~/.local/bin/ccusage-dsh`. Override the destination with
+`CCUSAGE_DSH_INSTALL_DIR` when needed.
+
+Prebuilt releases cover Windows x64, macOS x64/ARM64, and Linux x64/ARM64. You
+can also download an archive and `SHA256SUMS` directly from the
+[latest GitHub Release](https://github.com/Cookie-HOO/ccusage-dsh/releases/latest).
+
+DSH logs are read from `${DSH_HOME:-~/.dsh}/sessions/`. Use `DSH_HOME` to select
+another root. This fork is updated deliberately rather than automatically; each
+published tag identifies the upstream ccusage version and the DSH build revision.
+
 ## Major Sponsors
 
 <div align="center">
