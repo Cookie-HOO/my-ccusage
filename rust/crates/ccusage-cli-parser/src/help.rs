@@ -13,7 +13,12 @@ struct HelpPage {
 include!(concat!(env!("OUT_DIR"), "/cli-help.rs"));
 
 pub(crate) fn print_version_and_exit(version: &str) -> ! {
-    println!("ccusage {version}");
+    let executable = if version.contains("-my.") {
+        "my-ccusage"
+    } else {
+        "ccusage"
+    };
+    println!("{executable} {version}");
     process::exit(0);
 }
 
