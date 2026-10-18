@@ -1,8 +1,8 @@
 #!/usr/bin/env sh
 set -eu
 
-repo="Cookie-HOO/ccusage-dsh"
-install_dir="${CCUSAGE_DSH_INSTALL_DIR:-$HOME/.local/bin}"
+repo="Cookie-HOO/my-ccusage"
+install_dir="${MY_CCUSAGE_INSTALL_DIR:-$HOME/.local/bin}"
 
 case "$(uname -s)" in
   Darwin) os=macos ;;
@@ -16,7 +16,7 @@ case "$(uname -m)" in
   *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
 
-asset="ccusage-dsh-$os-$arch.tar.gz"
+asset="my-ccusage-$os-$arch.tar.gz"
 release_url="https://github.com/$repo/releases/latest/download"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT HUP INT TERM
@@ -36,12 +36,13 @@ curl -fsSL "$release_url/SHA256SUMS" -o "$tmp/SHA256SUMS"
 
 tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$install_dir"
-cp "$tmp/ccusage-dsh-$os-$arch/ccusage-dsh" "$install_dir/ccusage-dsh"
-chmod +x "$install_dir/ccusage-dsh"
+cp "$tmp/my-ccusage-$os-$arch/my-ccusage" "$install_dir/my-ccusage"
+chmod +x "$install_dir/my-ccusage"
 
-"$install_dir/ccusage-dsh" dsh --help >/dev/null
-printf 'Installed ccusage-dsh to %s\n' "$install_dir/ccusage-dsh"
+"$install_dir/my-ccusage" dsh --help >/dev/null
+"$install_dir/my-ccusage" workbuddy --help >/dev/null
+printf 'Installed my-ccusage to %s\n' "$install_dir/my-ccusage"
 case ":$PATH:" in
   *":$install_dir:"*) ;;
-  *) printf 'Add %s to PATH before running ccusage-dsh.\n' "$install_dir" ;;
+  *) printf 'Add %s to PATH before running my-ccusage.\n' "$install_dir" ;;
 esac

@@ -50,6 +50,7 @@ fn command_shared(command: &Command) -> &SharedArgs {
         | Command::Qwen(args)
         | Command::OpenClaw(args)
         | Command::Grok(args)
+        | Command::WorkBuddy(args)
         | Command::ZCode(args)
         | Command::Dsh(args) => &args.shared,
         Command::Statusline(_) => unreachable!("statusline keeps its own timezone field"),

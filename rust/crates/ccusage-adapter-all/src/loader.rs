@@ -12,7 +12,7 @@ use crate::{
     SessionAccumulator, UsageSummary,
     adapter::{
         amp, antigravity, claude, codebuff, codex, copilot, droid, dsh, gemini, goose, grok,
-        hermes, kilo, kimi, openclaw, opencode, pi, qwen, zcode,
+        hermes, kilo, kimi, openclaw, opencode, pi, qwen, workbuddy, zcode,
     },
     cli::{AgentReportKind, CodexSpeed, CostMode, NamedPiStore, SharedArgs, WeekDay},
     filter_loaded_entries_by_date, json_float,
@@ -358,6 +358,12 @@ fn load_base_rows(
         AgentLoadSpec {
             index: 18,
             agent: BUILT_IN_AGENT_NAMES[18],
+            progress_agent: crate::progress::UsageLoadAgent("WorkBuddy"),
+            load: Box::new(|| load_workbuddy_rows(load_kind, &loader_shared)),
+        },
+        AgentLoadSpec {
+            index: 19,
+            agent: BUILT_IN_AGENT_NAMES[19],
             progress_agent: crate::progress::UsageLoadAgent("ZCode"),
             load: Box::new(|| {
                 load_priced_summary_agent_rows(
@@ -641,6 +647,17 @@ fn filtered_pi_format_agent_rows(
     let summaries = pi::summarize_entries(&entries, kind)?;
     Ok(AgentRows {
         rows: summary_rows(agent, summaries, include_project_path),
+        detected,
+    })
+}
+
+fn load_workbuddy_rows(kind: AgentReportKind, shared: &SharedArgs) -> Result<AgentRows> {
+    let mut entries = workbuddy::load_entries(shared)?;
+    let detected = !entries.is_empty() || workbuddy::has_data();
+    filter_loaded_entries_by_date(&mut entries, shared);
+    let summaries = workbuddy::summarize_entries(&entries, kind)?;
+    Ok(AgentRows {
+        rows: summary_rows("workbuddy", summaries, kind == AgentReportKind::Session),
         detected,
     })
 }

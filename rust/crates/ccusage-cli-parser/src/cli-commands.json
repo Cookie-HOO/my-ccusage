@@ -115,6 +115,10 @@
 				"description": "Show DeepSeek Harness usage commands"
 			},
 			{
+				"name": "workbuddy",
+				"description": "Show WorkBuddy usage commands"
+			},
+			{
 				"name": "zcode",
 				"description": "Show ZCode usage commands"
 			}
@@ -846,6 +850,17 @@
 			]
 		},
 		{
+			"path": ["workbuddy"],
+			"description": "Usage reports for WorkBuddy.",
+			"usage": "ccusage workbuddy <COMMANDS>",
+			"commands": [
+				{
+					"name": "session",
+					"description": "Show WorkBuddy usage grouped by session"
+				}
+			]
+		},
+		{
 			"path": ["zcode"],
 			"description": "Usage reports for ZCode.",
 			"usage": "ccusage zcode <COMMANDS>",
@@ -880,6 +895,12 @@
 			"path": ["dsh", "session"],
 			"description": "Show DeepSeek Harness usage grouped by session",
 			"usage": "ccusage dsh session <OPTIONS>",
+			"options": "agent_options"
+		},
+		{
+			"path": ["workbuddy", "session"],
+			"description": "Show WorkBuddy usage grouped by session",
+			"usage": "ccusage workbuddy session <OPTIONS>",
 			"options": "agent_options"
 		},
 		{

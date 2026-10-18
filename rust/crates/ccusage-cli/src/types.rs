@@ -26,6 +26,7 @@ pub enum Command {
     Antigravity(AgentCommandArgs),
     Kimi(AgentCommandArgs),
     Qwen(AgentCommandArgs),
+    WorkBuddy(AgentCommandArgs),
     OpenClaw(AgentCommandArgs),
     Grok(AgentCommandArgs),
     ZCode(AgentCommandArgs),
@@ -202,6 +203,9 @@ pub const STANDARD_AGENT_REPORTS: &[(&str, AgentReportKind)] = &[
     ("monthly", AgentReportKind::Monthly),
     ("session", AgentReportKind::Session),
 ];
+
+pub const WORKBUDDY_AGENT_REPORTS: &[(&str, AgentReportKind)] =
+    &[("session", AgentReportKind::Session)];
 
 pub const OPENCODE_AGENT_REPORTS: &[(&str, AgentReportKind)] = &[
     ("daily", AgentReportKind::Daily),

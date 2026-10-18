@@ -1,10 +1,10 @@
 $ErrorActionPreference = 'Stop'
 
-$repo = 'Cookie-HOO/ccusage-dsh'
-$installDir = if ($env:CCUSAGE_DSH_INSTALL_DIR) {
-    $env:CCUSAGE_DSH_INSTALL_DIR
+$repo = 'Cookie-HOO/my-ccusage'
+$installDir = if ($env:MY_CCUSAGE_INSTALL_DIR) {
+    $env:MY_CCUSAGE_INSTALL_DIR
 } else {
-    Join-Path $env:LOCALAPPDATA 'Programs\ccusage-dsh'
+    Join-Path $env:LOCALAPPDATA 'Programs\my-ccusage'
 }
 
 if (-not [Environment]::Is64BitOperatingSystem) {
@@ -14,9 +14,9 @@ if ($env:PROCESSOR_ARCHITECTURE -notin @('AMD64', 'x86')) {
     throw "Unsupported Windows architecture: $env:PROCESSOR_ARCHITECTURE"
 }
 
-$asset = 'ccusage-dsh-windows-x64.zip'
+$asset = 'my-ccusage-windows-x64.zip'
 $releaseUrl = "https://github.com/$repo/releases/latest/download"
-$tempDir = Join-Path ([IO.Path]::GetTempPath()) ("ccusage-dsh-" + [guid]::NewGuid())
+$tempDir = Join-Path ([IO.Path]::GetTempPath()) ("my-ccusage-" + [guid]::NewGuid())
 New-Item -ItemType Directory -Force -Path $tempDir | Out-Null
 
 try {
@@ -33,11 +33,13 @@ try {
 
     Expand-Archive $archive -DestinationPath $tempDir -Force
     New-Item -ItemType Directory -Force -Path $installDir | Out-Null
-    $destination = Join-Path $installDir 'ccusage-dsh.exe'
-    Copy-Item (Join-Path $tempDir 'ccusage-dsh-windows-x64\ccusage-dsh.exe') $destination -Force
+    $destination = Join-Path $installDir 'my-ccusage.exe'
+    Copy-Item (Join-Path $tempDir 'my-ccusage-windows-x64\my-ccusage.exe') $destination -Force
 
     & $destination dsh --help | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'Installed binary failed the DSH verification.' }
+    & $destination workbuddy --help | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw 'Installed binary failed the WorkBuddy verification.' }
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $pathEntries = @($userPath -split ';' | Where-Object { $_ })
@@ -49,8 +51,8 @@ try {
         $env:Path = "$env:Path;$installDir"
     }
 
-    Write-Host "Installed ccusage-dsh to $destination"
-    Write-Host 'Open a new terminal, then run: ccusage-dsh dsh daily'
+    Write-Host "Installed my-ccusage to $destination"
+    Write-Host 'Open a new terminal, then run: my-ccusage dsh daily'
 } finally {
     Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 }

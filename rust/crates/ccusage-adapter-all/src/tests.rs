@@ -766,6 +766,41 @@ fn multi_section_codex_fixture_matches_standalone_sections_for_daily_and_session
 }
 
 #[test]
+fn workbuddy_fixture_feeds_unified_daily_and_session_project_metadata() {
+    let line = r#"{"id":"message-1","timestamp":1792327339000,"type":"message","role":"assistant","sessionId":"session-1","cwd":"/workspace/project","providerData":{"conversationRequestId":"request-1","model":"auto","requestModelId":"gpt-5.6-sol","requestModelName":"Auto","rawUsage":{"prompt_cache_hit_tokens":12032,"credit":1.92},"usage":{"inputTokens":30746,"outputTokens":434,"totalTokens":31180,"inputTokensDetails":[{"cached_tokens":12032}]}}}"#;
+    let fixture = fs_fixture!({
+        "workbuddy/projects/workspace/session-1.jsonl": line,
+    });
+    let _env = isolated_agent_env(
+        &fixture,
+        "WORKBUDDY_HOME",
+        fixture.path("workbuddy").into_os_string(),
+    );
+    let shared = fixture_shared("20261018", "20261018");
+
+    let daily = load_rows(AgentReportKind::Daily, &shared).unwrap();
+    let session = load_rows(AgentReportKind::Session, &shared).unwrap();
+
+    assert_eq!(daily.detected_agents, vec!["workbuddy"]);
+    assert_eq!(daily.rows.len(), 1);
+    assert_eq!(daily.rows[0].agent, "all");
+    let json = report::report_json_with_agents(&daily.rows, AgentReportKind::Daily, true);
+    let workbuddy = &json["daily"][0]["agents"][0];
+    assert_eq!(workbuddy["agent"], "workbuddy");
+    assert_eq!(workbuddy["inputTokens"], 18_714);
+    assert_eq!(workbuddy["outputTokens"], 434);
+    assert_eq!(workbuddy["cacheReadTokens"], 12_032);
+    assert_eq!(workbuddy["totalTokens"], 31_180);
+    assert_eq!(workbuddy["modelsUsed"], json!(["gpt-5.6-sol"]));
+    assert_eq!(session.detected_agents, vec!["workbuddy"]);
+    assert_eq!(session.rows[0].period, "session-1");
+    assert_eq!(
+        session.rows[0].metadata.as_ref().unwrap()["projectPath"],
+        "/workspace/project"
+    );
+}
+
+#[test]
 fn zcode_fixture_reports_daily_monthly_session_json_and_table_snapshots() {
     let fixture = fs_fixture!({});
     let _ = fixture.create_dir_all("zcode/cli/db");
@@ -1007,6 +1042,7 @@ fn isolated_agent_env(
         "KIMI_DATA_DIR",
         "QWEN_DATA_DIR",
         "GROK_HOME",
+        "WORKBUDDY_HOME",
         "ZCODE_HOME",
     ]
     .into_iter()
