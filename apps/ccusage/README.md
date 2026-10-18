@@ -24,45 +24,70 @@
 > Analyze coding (agent) CLI token usage and costs from local data.
 
 > [!IMPORTANT]
-> This repository is an unofficial distribution of ccusage with the
-> [DeepSeek Harness (DSH) adapter](https://github.com/oksure/ccusage/tree/contrib/dsh-usage-adapter).
-> It publishes pinned native binaries for Windows, macOS, and Linux. For the
-> official project and npm package, see [`ccusage/ccusage`](https://github.com/ccusage/ccusage).
+> **my-ccusage** is an unofficial, upstream-first distribution of
+> [`ccusage`](https://github.com/ccusage/ccusage). It keeps the upstream
+> implementation and supplements sources that ccusage-viz needs but upstream
+> does not yet support: the community DeepSeek Harness adapter and a stateless
+> WorkBuddy adapter. It is not affiliated with or endorsed by the official
+> ccusage project.
 
-## Install this DSH build
+## Install my-ccusage
 
 ### Windows x64
 
 Run in PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/Cookie-HOO/ccusage-dsh/main/install.ps1 | iex
-ccusage-dsh dsh daily
+irm https://raw.githubusercontent.com/Cookie-HOO/my-ccusage/main/install.ps1 | iex
+my-ccusage dsh daily
 ```
 
 The installer verifies the release SHA-256 checksum, installs
-`ccusage-dsh.exe` under `%LOCALAPPDATA%\Programs\ccusage-dsh`, and adds that
+`my-ccusage.exe` under `%LOCALAPPDATA%\Programs\my-ccusage`, and adds that
 folder to the user `PATH`. Open a new terminal if the command is not immediately
-available.
+available. Override the destination with `MY_CCUSAGE_INSTALL_DIR` when needed.
 
 ### macOS and Linux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Cookie-HOO/ccusage-dsh/main/install.sh | sh
-ccusage-dsh dsh daily
+curl -fsSL https://raw.githubusercontent.com/Cookie-HOO/my-ccusage/main/install.sh | sh
+my-ccusage dsh daily
 ```
 
 The installer verifies the release checksum and installs to
-`~/.local/bin/ccusage-dsh`. Override the destination with
-`CCUSAGE_DSH_INSTALL_DIR` when needed.
+`~/.local/bin/my-ccusage`. Override the destination with
+`MY_CCUSAGE_INSTALL_DIR` when needed.
 
 Prebuilt releases cover Windows x64, macOS x64/ARM64, and Linux x64/ARM64. You
 can also download an archive and `SHA256SUMS` directly from the
-[latest GitHub Release](https://github.com/Cookie-HOO/ccusage-dsh/releases/latest).
+[latest GitHub Release](https://github.com/Cookie-HOO/my-ccusage/releases/latest).
 
-DSH logs are read from `${DSH_HOME:-~/.dsh}/sessions/`. Use `DSH_HOME` to select
-another root. This fork is updated deliberately rather than automatically; each
-published tag identifies the upstream ccusage version and the DSH build revision.
+DSH logs are read from `${DSH_HOME:-~/.dsh}/sessions/`. WorkBuddy usage is read
+from `~/.workbuddy-ai/projects/**/*.jsonl` and
+`~/.workbuddy/projects/**/*.jsonl`; use `WORKBUDDY_HOME` to select one or more
+comma-separated roots. The WorkBuddy adapter creates no cache, archive, index,
+or database. This fork is updated deliberately rather than automatically; each
+published tag identifies the upstream ccusage version and the distribution
+revision, for example `v20.0.34-my.1`.
+
+## Supplemental adapter policy
+
+my-ccusage keeps each supplemental source in an isolated Rust adapter crate.
+When upstream ccusage adds an equivalent source, the local adapter is removed
+in favor of upstream after the upstream implementation passes the ccusage-viz
+compatibility checks.
+
+| Source | Implementation | Unified daily | Project session | Full focused reports |
+| --- | --- | :---: | :---: | :---: |
+| Official ccusage sources | Upstream | Yes | As upstream | Yes |
+| DeepSeek Harness | Community fork | Yes | Yes | Yes |
+| WorkBuddy | my-ccusage | Yes | Yes | No |
+
+The WorkBuddy adapter reads `providerData.usage` from official local JSONL logs,
+creates no cache, archive, index, or database, and never modifies WorkBuddy
+data. Its focused surface is deliberately limited to the JSON session report
+needed for ccusage-viz project attribution; daily data is available through the
+unified report.
 
 ## Major Sponsors
 
@@ -122,9 +147,10 @@ ccusage reads local usage data from coding agent CLIs and turns it into daily, w
 | Antigravity        | `ccusage antigravity daily` |
 | Grok Build CLI     | `ccusage grok daily`        |
 | DeepSeek Harness   | `ccusage dsh daily`         |
+| WorkBuddy          | `my-ccusage workbuddy session --json` |
 | ZCode              | `ccusage zcode daily`       |
 
-Use `ccusage daily`, `ccusage weekly`, `ccusage monthly`, or `ccusage session` to include every detected source in one report.
+Use `my-ccusage daily --by-agent --json` for the ccusage-viz-compatible unified report. Upstream sources retain their official focused commands. Supplemental adapters may intentionally implement only the subset required by ccusage-viz.
 
 ## Installation
 
@@ -179,7 +205,8 @@ bunx ccusage copilot daily
 bunx ccusage gemini daily
 bunx ccusage antigravity daily
 bunx ccusage grok daily
-bunx ccusage dsh daily
+my-ccusage dsh daily
+my-ccusage workbuddy session --json
 bunx ccusage zcode daily
 bunx ccusage pi daily --pi-path /path/to/sessions
 bunx ccusage pi daily --pi-path /path/to/sessions,/archive/pi/sessions
@@ -213,7 +240,7 @@ bunx ccusage monthly --compact  # Compact monthly report
 - 📊 **Daily Report**: View token usage and costs aggregated by date
 - 📅 **Monthly Report**: View token usage and costs aggregated by month
 - 💬 **Session Report**: View usage grouped by conversation sessions
-- 🤖 **Unified CLI Reports**: View Claude Code, Codex, OpenCode, Amp, Droid, Codebuff, Hermes Agent, pi-agent, Goose, OpenClaw, Kilo, Kimi, Qwen, GitHub Copilot CLI, Gemini CLI, Antigravity, Grok Build CLI, DeepSeek Harness, and ZCode usage from one CLI
+- 🤖 **Unified CLI Reports**: View Claude Code, Codex, OpenCode, Amp, Droid, Codebuff, Hermes Agent, pi-agent, Goose, OpenClaw, Kilo, Kimi, Qwen, GitHub Copilot CLI, Gemini CLI, Antigravity, Grok Build CLI, DeepSeek Harness, WorkBuddy, and ZCode usage from one CLI
 - ⏰ **5-Hour Blocks Report**: Track usage within Claude's billing windows with active block monitoring
 - 🚀 **Statusline Integration**: Compact usage display for Claude Code status bar hooks (Beta)
 - 🤖 **Model Tracking**: See which models are used across supported sources
