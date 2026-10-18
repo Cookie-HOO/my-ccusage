@@ -79,6 +79,7 @@ pub const BUILT_IN_AGENT_NAMES: &[&str] = &[
     "qwen",
     "grok",
     "dsh",
+    "workbuddy",
     "zcode",
 ];
 

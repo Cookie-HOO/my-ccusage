@@ -5,8 +5,8 @@ use crate::help::{print_help_and_exit, print_version_and_exit};
 use ccusage_cli::{
     AgentCommandArgs, AgentReportKind, BlocksArgs, CliConfig, CodexSpeed, Command, CostMode,
     CostSource, DATE_BOUND_FORMATS, DailyArgs, OPENCODE_AGENT_REPORTS, STANDARD_AGENT_REPORTS,
-    SessionArgs, SharedArgs, SortOrder, StatuslineArgs, VisualBurnRate, WeekDay, WeeklyArgs,
-    normalize_date_bound,
+    SessionArgs, SharedArgs, SortOrder, StatuslineArgs, VisualBurnRate, WORKBUDDY_AGENT_REPORTS,
+    WeekDay, WeeklyArgs, normalize_date_bound,
 };
 
 use crate::Cli;
@@ -355,6 +355,13 @@ fn parse_command(
         "dsh" => {
             parse_basic_agent_command(parser, shared, "dsh", STANDARD_AGENT_REPORTS, Command::Dsh)
         }
+        "workbuddy" => parse_basic_agent_command(
+            parser,
+            shared,
+            "workbuddy",
+            WORKBUDDY_AGENT_REPORTS,
+            Command::WorkBuddy,
+        ),
         "zcode" => parse_basic_agent_command(
             parser,
             shared,
@@ -808,6 +815,7 @@ fn is_command(arg: &str) -> bool {
             | "qwen"
             | "grok"
             | "dsh"
+            | "workbuddy"
             | "zcode"
     )
 }
@@ -879,13 +887,18 @@ fn unsupported_agent_report_error(args: &[String]) -> Option<String> {
     }
 
     let display = agent_display_name(agent);
+    let suggested_report = if agent == "workbuddy" {
+        "session"
+    } else {
+        "daily"
+    };
     let message = if matches!(report.as_str(), "blocks" | "statusline") {
         format!(
-            "The \"{report}\" report is only available for Claude Code usage.\nUse \"ccusage {agent} daily\" for {display} usage reports."
+            "The \"{report}\" report is only available for Claude Code usage.\nUse \"ccusage {agent} {suggested_report}\" for {display} usage reports."
         )
     } else {
         format!(
-            "The \"{report}\" report is not available for {display} usage.\nUse \"ccusage {agent} daily\" for {display} usage reports."
+            "The \"{report}\" report is not available for {display} usage.\nUse \"ccusage {agent} {suggested_report}\" for {display} usage reports."
         )
     };
     Some(message)
@@ -971,6 +984,7 @@ fn is_agent_command(command: &str) -> bool {
             | "openclaw"
             | "grok"
             | "dsh"
+            | "workbuddy"
             | "zcode"
     )
 }
@@ -987,6 +1001,7 @@ fn agent_report_supported(agent: &str, report: &str) -> bool {
         | "gemini" | "antigravity" | "kimi" | "qwen" | "openclaw" | "grok" | "dsh" | "zcode" => {
             matches!(report, "daily" | "monthly" | "session")
         }
+        "workbuddy" => report == "session",
         _ => false,
     }
 }
@@ -1011,6 +1026,7 @@ fn agent_display_name(agent: &str) -> &'static str {
         "openclaw" => "OpenClaw",
         "grok" => "Grok",
         "dsh" => "DeepSeek Harness",
+        "workbuddy" => "WorkBuddy",
         "zcode" => "ZCode",
         _ => unreachable!("agent is prevalidated"),
     }
@@ -1099,6 +1115,7 @@ fn report_shared<'a>(
             | Command::OpenClaw(args)
             | Command::Grok(args)
             | Command::Dsh(args)
+            | Command::WorkBuddy(args)
             | Command::ZCode(args),
         ) => (&args.shared, args.kind != AgentReportKind::Session),
     }

@@ -208,6 +208,7 @@ fn command_snapshot(command: Option<Command>) -> Value {
         Some(Command::OpenClaw(args)) => agent_command_snapshot("openclaw", args),
         Some(Command::Grok(args)) => agent_command_snapshot("grok", args),
         Some(Command::Dsh(args)) => agent_command_snapshot("dsh", args),
+        Some(Command::WorkBuddy(args)) => agent_command_snapshot("workbuddy", args),
         Some(Command::ZCode(args)) => agent_command_snapshot("zcode", args),
     }
 }
@@ -807,8 +808,25 @@ fn applies_schema_documented_config_file_options() {
 fn root_help_lists_agent_namespaces_without_nested_commands() {
     let help = help_text();
     let agents = [
-        "claude", "codex", "opencode", "amp", "droid", "codebuff", "hermes", "pi", "goose", "kilo",
-        "copilot", "gemini", "kimi", "qwen", "openclaw", "grok", "dsh", "zcode",
+        "claude",
+        "codex",
+        "opencode",
+        "amp",
+        "droid",
+        "codebuff",
+        "hermes",
+        "pi",
+        "goose",
+        "kilo",
+        "copilot",
+        "gemini",
+        "kimi",
+        "qwen",
+        "openclaw",
+        "grok",
+        "dsh",
+        "workbuddy",
+        "zcode",
     ];
 
     for agent in agents {
@@ -1485,6 +1503,16 @@ fn parses_dsh_session_options() {
     let cli = parse(&["ccusage", "dsh", "session", "--json"]);
     let Some(Command::Dsh(args)) = cli.command else {
         panic!("expected dsh command");
+    };
+    assert_eq!(args.kind, AgentReportKind::Session);
+    assert!(args.shared.json);
+}
+
+#[test]
+fn parses_workbuddy_session_options() {
+    let cli = parse(&["ccusage", "workbuddy", "session", "--json"]);
+    let Some(Command::WorkBuddy(args)) = cli.command else {
+        panic!("expected workbuddy command");
     };
     assert_eq!(args.kind, AgentReportKind::Session);
     assert!(args.shared.json);
